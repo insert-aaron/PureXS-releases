@@ -95,6 +95,12 @@ if not exist "%INSTALL_DIR%\.git" (
         exit /b 1
     )
     echo [PureXS] Download complete.
+
+    :: Create a desktop shortcut
+    set "SHORTCUT_PATH=%USERPROFILE%\Desktop\PureXS.lnk"
+    echo [PureXS] Creating Desktop shortcut...
+    powershell -NoProfile -Command "$wshell = New-Object -ComObject WScript.Shell; $s = $wshell.CreateShortcut('%USERPROFILE%\Desktop\PureXS.lnk'); $s.TargetPath = '%INSTALL_DIR%\SetupAndRun.bat'; $s.WorkingDirectory = '%INSTALL_DIR%'; $s.IconLocation = '%INSTALL_DIR%\PureXS.WPF.exe'; $s.Description = 'PureXS Auto-Updater'; $s.Save()"
+
     goto :launch
 )
 
