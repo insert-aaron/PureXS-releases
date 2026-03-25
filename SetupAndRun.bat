@@ -9,7 +9,7 @@ setlocal enabledelayedexpansion
 
 set "INSTALL_DIR=C:\PureXS"
 set "REPO_URL=https://github.com/insert-aaron/PureXS-releases.git"
-set "EXE_NAME=PureXS.WPF.exe"
+set "EXE_NAME=PureXS.exe"
 set "DOTNET_DOWNLOAD=https://dotnet.microsoft.com/en-us/download/dotnet/8.0"
 
 :: Detect architecture
@@ -99,7 +99,7 @@ if not exist "%INSTALL_DIR%\.git" (
     :: Create a desktop shortcut
     set "SHORTCUT_PATH=%USERPROFILE%\Desktop\PureXS.lnk"
     echo [PureXS] Creating Desktop shortcut...
-    powershell -NoProfile -Command "$wshell = New-Object -ComObject WScript.Shell; $s = $wshell.CreateShortcut('%USERPROFILE%\Desktop\PureXS.lnk'); $s.TargetPath = '%INSTALL_DIR%\SetupAndRun.bat'; $s.WorkingDirectory = '%INSTALL_DIR%'; $s.IconLocation = '%INSTALL_DIR%\PureXS.WPF.exe'; $s.Description = 'PureXS Auto-Updater'; $s.Save()"
+    powershell -NoProfile -Command "$wshell = New-Object -ComObject WScript.Shell; $s = $wshell.CreateShortcut('%USERPROFILE%\Desktop\PureXS.lnk'); $s.TargetPath = '%INSTALL_DIR%\SetupAndRun.bat'; $s.WorkingDirectory = '%INSTALL_DIR%'; $s.IconLocation = '%EXE_PATH%'; $s.Description = 'PureXS Auto-Updater'; $s.Save()"
 
     goto :launch
 )
