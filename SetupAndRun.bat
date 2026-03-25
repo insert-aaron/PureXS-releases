@@ -7,7 +7,8 @@ setlocal enabledelayedexpansion
 :: Installs to C:\PureXS (no admin rights needed for updates)
 :: ============================================================
 
-set "INSTALL_DIR=C:\PureXS"
+set "INSTALL_DIR=%~dp0"
+if "%INSTALL_DIR:~-1%"=="\" set "INSTALL_DIR=%INSTALL_DIR:~0,-1%"
 set "REPO_URL=https://github.com/insert-aaron/PureXS-releases.git"
 set "EXE_NAME=PureXS.exe"
 set "DOTNET_DOWNLOAD=https://dotnet.microsoft.com/en-us/download/dotnet/8.0"
@@ -95,12 +96,6 @@ if not exist "%INSTALL_DIR%\.git" (
         exit /b 1
     )
     echo [PureXS] Download complete.
-
-    :: Create a desktop shortcut
-    set "SHORTCUT_PATH=%USERPROFILE%\Desktop\PureXS.lnk"
-    echo [PureXS] Creating Desktop shortcut...
-    powershell -NoProfile -Command "$wshell = New-Object -ComObject WScript.Shell; $s = $wshell.CreateShortcut('%USERPROFILE%\Desktop\PureXS.lnk'); $s.TargetPath = '%INSTALL_DIR%\SetupAndRun.bat'; $s.WorkingDirectory = '%INSTALL_DIR%'; $s.IconLocation = '%EXE_PATH%'; $s.Description = 'PureXS Auto-Updater'; $s.Save()"
-
     goto :launch
 )
 
@@ -150,9 +145,16 @@ popd
 :launch
 if not exist "%EXE_PATH%" (
     echo [PureXS] ERROR: Executable not found at %EXE_PATH%
-    echo [PureXS] The installation may be corrupt. Delete C:\PureXS and re-run this script.
+    echo [PureXS] The installation may be corrupt. Delete %INSTALL_DIR% and re-run this script.
     pause
     exit /b 1
+)
+
+:: Create a desktop shortcut if it doesn't exist
+set "SHORTCUT_PATH=%USERPROFILE%\Desktop\PureXS.lnk"
+if not exist "!SHORTCUT_PATH!" (
+    echo [PureXS] Creating Desktop shortcut...
+    powershell -NoProfile -Command "$wshell = New-Object -ComObject WScript.Shell; $s = $wshell.CreateShortcut('%USERPROFILE%\Desktop\PureXS.lnk'); $s.TargetPath = '%INSTALL_DIR%\SetupAndRun.bat'; $s.WorkingDirectory = '%INSTALL_DIR%'; $s.IconLocation = '%EXE_PATH%'; $s.Description = 'PureXS Auto-Updater'; $s.Save()"
 )
 
 echo [PureXS] Launching PureXS (%ARCH%)...
