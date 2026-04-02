@@ -229,14 +229,7 @@ if not exist "%DATA_DIR%\patients" mkdir "%DATA_DIR%\patients"
 set "SHORTCUT_PATH=%USERPROFILE%\Desktop\%SHORTCUT_NAME%.lnk"
 if not exist "!SHORTCUT_PATH!" (
     echo [%APP_NAME%] Creating Desktop shortcut...
-    powershell -NoProfile -Command ^
-        "$ws = New-Object -ComObject WScript.Shell; ^
-         $sc = $ws.CreateShortcut('%USERPROFILE%\Desktop\%SHORTCUT_NAME%.lnk'); ^
-         $sc.TargetPath = '%INSTALL_DIR%\SetupAndRun.bat'; ^
-         $sc.WorkingDirectory = '%INSTALL_DIR%'; ^
-         $sc.IconLocation = '%EXE_PATH%'; ^
-         $sc.Description = 'PureXS - Panoramic X-Ray Pipeline'; ^
-         $sc.Save()"
+    powershell -NoProfile -Command "$ws = New-Object -ComObject WScript.Shell; $sc = $ws.CreateShortcut('%USERPROFILE%\Desktop\%SHORTCUT_NAME%.lnk'); $sc.TargetPath = '%INSTALL_DIR%\SetupAndRun.bat'; $sc.WorkingDirectory = '%INSTALL_DIR%'; $sc.IconLocation = '%EXE_PATH%'; $sc.Description = 'PureXS - Panoramic X-Ray Pipeline'; $sc.Save()"
     if exist "!SHORTCUT_PATH!" (
         echo [%APP_NAME%] Desktop shortcut created.
     ) else (
