@@ -2428,14 +2428,29 @@ def reconstruct_image(
         if invert:
             normalized = 1.0 - normalized
 
-        img_8 = (normalized * 255).astype(np.uint8)
+        # Conservative CLAHE for local contrast (root/bone detail)
+        img_16 = (normalized * 65535).astype(np.uint16)
+        try:
+            import cv2
+            clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(32, 32))
+            img_16 = clahe.apply(img_16)
+        except ImportError:
+            pass
+        img_8 = (img_16 >> 8).astype(np.uint8)
 
-        # Mild unsharp mask for a touch of crispness
+        # Zoom crop — fill the frame with anatomy
         img_pil = Image.fromarray(img_8, mode="L")
+        crop_t, crop_b = 30, min(700, height)
+        crop_l, crop_r = 80, min(2380, width)
+        if crop_b > crop_t and crop_r > crop_l:
+            img_pil = img_pil.crop((crop_l, crop_t, crop_r, crop_b))
+            img_pil = img_pil.resize((2440, 1280), Image.Resampling.LANCZOS)
+
+        # Mild unsharp mask (softer than Full pipeline)
         try:
             from PIL import ImageFilter
             img_pil = img_pil.filter(
-                ImageFilter.UnsharpMask(radius=2, percent=60, threshold=3)
+                ImageFilter.UnsharpMask(radius=1, percent=60, threshold=3)
             )
         except Exception:
             pass
