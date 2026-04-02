@@ -2425,6 +2425,15 @@ def reconstruct_image(
         clipped = np.clip(img_f, low, high)
         normalized = (clipped - low) / (high - low)
 
+        # Column gain normalization
+        _img8_pre = (normalized * 255).astype(np.uint8)
+        _col_arr = _img8_pre.astype(np.float32)
+        from scipy.ndimage import gaussian_filter1d as _gf1d_clean
+        _col_means = _col_arr[50:650, :].mean(axis=0)
+        _col_smooth = _gf1d_clean(_col_means.astype(np.float64), sigma=150)
+        _col_norm = _col_smooth.mean() / np.maximum(_col_smooth, 1.0)
+        normalized = np.clip(_col_arr * _col_norm[np.newaxis, :], 0, 255).astype(np.float32) / 255.0
+
         if invert:
             normalized = 1.0 - normalized
 
@@ -2438,10 +2447,10 @@ def reconstruct_image(
             pass
         img_8 = (img_16 >> 8).astype(np.uint8)
 
-        # Zoom crop — fill the frame with anatomy
+        # Zoom crop — wider/taller to preserve full arch + TMJ condyles
         img_pil = Image.fromarray(img_8, mode="L")
-        crop_t, crop_b = 30, min(700, height)
-        crop_l, crop_r = 80, min(2380, width)
+        crop_t, crop_b = 20, min(760, height)
+        crop_l, crop_r = 40, min(2440, width)
         if crop_b > crop_t and crop_r > crop_l:
             img_pil = img_pil.crop((crop_l, crop_t, crop_r, crop_b))
             img_pil = img_pil.resize((2440, 1280), Image.Resampling.LANCZOS)
