@@ -2032,6 +2032,7 @@ def reconstruct_image(
     scanlines: list[Scanline],
     invert: bool = True,
     repair_mask: np.ndarray | None = None,
+    mode: str = "full",
 ) -> Image.Image | None:
     """Reconstruct a panoramic image from decoded scanlines.
 
@@ -2045,6 +2046,9 @@ def reconstruct_image(
             telemetry-repaired pixels.  Used for linear-domain inpainting.
         invert: If True (default), invert for dental convention
                 (MONOCHROME1 — bone/tooth = white, air = black).
+        mode: Processing mode — "full" for the complete correction
+              pipeline, "clean" for a minimal percentile-stretch approach
+              with only essential corrections (dark, die gap, dead rows).
 
     Returns:
         PIL Image (8-bit grayscale) or None.
@@ -2402,6 +2406,43 @@ def reconstruct_image(
     _dbg = ((img_f - img_f.min()) / max(img_f.max() - img_f.min(), 1) * 255).astype(np.uint8)
     Image.fromarray(_dbg).save("debug_stage03_row_repair.png")
     log.info("DEBUG saved: debug_stage03_row_repair.png")
+
+    # ── "Clean" mode: minimal processing, early return ──────────────────
+    #   After dark correction, die junction fix, and dead-row repair,
+    #   apply a simple percentile contrast stretch (like the scanline
+    #   preview) and return.  Skips MUSICA, frame EQ, column corrections,
+    #   deband passes — preserves the natural tonal range.
+    if mode == "clean":
+        # Percentile contrast stretch on non-zero pixels
+        nz = img_f[img_f > 0]
+        if len(nz) > 0:
+            low = np.percentile(nz, 2)
+            high = np.percentile(nz, 98)
+        else:
+            low, high = 0.0, 1.0
+        if high <= low:
+            high = low + 1
+        clipped = np.clip(img_f, low, high)
+        normalized = (clipped - low) / (high - low)
+
+        if invert:
+            normalized = 1.0 - normalized
+
+        img_8 = (normalized * 255).astype(np.uint8)
+
+        # Mild unsharp mask for a touch of crispness
+        img_pil = Image.fromarray(img_8, mode="L")
+        try:
+            from PIL import ImageFilter
+            img_pil = img_pil.filter(
+                ImageFilter.UnsharpMask(radius=2, percent=60, threshold=3)
+            )
+        except Exception:
+            pass
+
+        log.info("Clean mode: %dx%d  percentile=[%.0f, %.0f]",
+                 width, height, low, high)
+        return img_pil
 
     # ── Frame gain equalization (per-die) ──────────────────────────────
     #   Each TCP frame (~24.9 columns) has slightly different detector
