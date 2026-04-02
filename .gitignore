@@ -1,0 +1,11 @@
+flat_field_norm.npy
+flat_field_raw.bin
+.purexs_installed
+last_scan_raw.bin
+last_scan_calibration.bin
+*.pyc
+__pycache__/
+python/
+Thumbs.db
+Desktop.ini
+.DS_Store
