@@ -41,6 +41,17 @@ if "%PROCESSOR_ARCHITECTURE%"=="AMD64" (
 )
 
 title %APP_NAME% Setup and Launcher
+
+:: Log file for debugging shortcut launches
+set "LOGFILE=%INSTALL_DIR%\purexs_launcher.log"
+echo. >> "%LOGFILE%"
+echo ============================================ >> "%LOGFILE%"
+echo [%date% %time%] Launcher started >> "%LOGFILE%"
+echo   Architecture: %ARCH% >> "%LOGFILE%"
+echo   Install dir:  %INSTALL_DIR% >> "%LOGFILE%"
+echo   Launched from: %~f0 >> "%LOGFILE%"
+echo ============================================ >> "%LOGFILE%"
+
 echo.
 echo ========================================
 echo   %APP_NAME% - Setup and Launcher
@@ -155,6 +166,7 @@ echo [%APP_NAME%] Continuing without Python — decoder unavailable.
 if not exist "%INSTALL_DIR%\.git" (
     if not exist "%MARKER%" (
         echo [%APP_NAME%] Fresh install — cloning repository...
+        echo [%date% %time%] State 1: fresh clone ^(.git missing, marker missing^) >> "%LOGFILE%"
         goto :fresh_clone
     )
 )
@@ -163,6 +175,7 @@ if not exist "%INSTALL_DIR%\.git" (
 if exist "%INSTALL_DIR%\.git" (
     if not exist "%MARKER%" (
         echo [%APP_NAME%] Repository found but not configured — running post-install...
+        echo [%date% %time%] State 2: post-install ^(.git exists, marker missing^) >> "%LOGFILE%"
         goto :post_install
     )
 )
@@ -171,12 +184,14 @@ if exist "%INSTALL_DIR%\.git" (
 if exist "%INSTALL_DIR%\.git" (
     if exist "%MARKER%" (
         echo [%APP_NAME%] Checking for updates...
+        echo [%date% %time%] State 3: returning launch ^(.git exists, marker exists^) >> "%LOGFILE%"
         goto :check_update
     )
 )
 
-:: Fallback: shouldn't get here, but handle it
+:: Fallback: .git missing but marker exists — re-clone needed
 echo [%APP_NAME%] Unexpected state — attempting launch...
+echo [%date% %time%] FALLBACK: .git missing=%INSTALL_DIR%\.git marker=%MARKER% >> "%LOGFILE%"
 goto :launch
 
 :: ============================================================
@@ -255,37 +270,50 @@ goto :launch
 :check_update
 pushd "%INSTALL_DIR%"
 
-git fetch --depth=1 origin %BRANCH% >nul 2>&1
+echo [%date% %time%] State 3: check_update >> "%LOGFILE%"
+echo [%date% %time%] Running: git fetch origin %BRANCH% >> "%LOGFILE%"
+
+git fetch origin %BRANCH% 2>> "%LOGFILE%"
 if %errorlevel% neq 0 (
     echo [%APP_NAME%] WARNING: Could not check for updates (no network?).
+    echo [%date% %time%] FETCH FAILED errorlevel=%errorlevel% >> "%LOGFILE%"
     popd
     goto :launch
 )
+
+echo [%date% %time%] Fetch succeeded >> "%LOGFILE%"
 
 :: Compare local vs remote
 for /f "delims=" %%A in ('git rev-parse HEAD') do set "LOCAL_HASH=%%A"
 for /f "delims=" %%A in ('git rev-parse origin/%BRANCH%') do set "REMOTE_HASH=%%A"
 
+echo [%date% %time%] LOCAL:  !LOCAL_HASH! >> "%LOGFILE%"
+echo [%date% %time%] REMOTE: !REMOTE_HASH! >> "%LOGFILE%"
+
 if "!LOCAL_HASH!"=="!REMOTE_HASH!" (
     echo [%APP_NAME%] Already up to date.
+    echo [%date% %time%] Already up to date — skipping pull >> "%LOGFILE%"
     popd
     goto :launch
 )
 
 echo [%APP_NAME%] Update available — installing...
+echo [%date% %time%] Update available — running git reset --hard origin/%BRANCH% >> "%LOGFILE%"
 
 :: Kill running instance
 taskkill /f /im "%EXE_NAME%" >nul 2>&1
 
 :: Pull latest (flat_field_norm.npy + .purexs_installed are in .gitignore, safe)
-git reset --hard origin/%BRANCH% >nul 2>&1
+git reset --hard origin/%BRANCH% 2>> "%LOGFILE%"
 if %errorlevel% neq 0 (
     echo [%APP_NAME%] WARNING: Update failed. Launching previous version...
+    echo [%date% %time%] RESET FAILED errorlevel=%errorlevel% >> "%LOGFILE%"
     popd
     goto :launch
 )
 
 echo [%APP_NAME%] Updated successfully.
+echo [%date% %time%] Updated successfully >> "%LOGFILE%"
 
 :: Re-install decoder deps in case requirements changed
 if defined PYTHON_CMD (
@@ -317,6 +345,7 @@ if defined PYTHON_CMD (
 :: Create data directory (in case update wiped it)
 if not exist "%DATA_DIR%" mkdir "%DATA_DIR%"
 
+echo [%date% %time%] Launching %EXE_PATH% >> "%LOGFILE%"
 echo [%APP_NAME%] Launching %APP_NAME% (%ARCH%)...
 start "" "%EXE_PATH%"
 exit /b 0
