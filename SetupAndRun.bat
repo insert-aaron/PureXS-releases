@@ -273,8 +273,8 @@ pushd "%INSTALL_DIR%"
 echo [%date% %time%] State 3: check_update >> "%LOGFILE%"
 
 :: Fetch and explicitly update the remote tracking ref (not just FETCH_HEAD)
-echo [%date% %time%] Running: git fetch origin %BRANCH%:refs/remotes/origin/%BRANCH% >> "%LOGFILE%"
-git fetch origin %BRANCH%:refs/remotes/origin/%BRANCH% >> "%LOGFILE%" 2>&1
+echo [%date% %time%] Running: git fetch origin +%BRANCH%:refs/remotes/origin/%BRANCH% >> "%LOGFILE%"
+git fetch origin +%BRANCH%:refs/remotes/origin/%BRANCH% >> "%LOGFILE%" 2>&1
 set "FETCH_ERR=!errorlevel!"
 echo [%date% %time%] Fetch exit code: !FETCH_ERR! >> "%LOGFILE%"
 
