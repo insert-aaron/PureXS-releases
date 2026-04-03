@@ -269,7 +269,6 @@ goto :launch
 :: ============================================================
 :check_update
 pushd "%INSTALL_DIR%"
-
 echo [%date% %time%] State 3: check_update >> "%LOGFILE%"
 
 :: Fetch and explicitly update the remote tracking ref (not just FETCH_HEAD)
@@ -278,56 +277,34 @@ git fetch origin +%BRANCH%:refs/remotes/origin/%BRANCH% >> "%LOGFILE%" 2>&1
 set "FETCH_ERR=!errorlevel!"
 echo [%date% %time%] Fetch exit code: !FETCH_ERR! >> "%LOGFILE%"
 
-if !FETCH_ERR! neq 0 (
-    echo [%APP_NAME%] WARNING: Could not check for updates (no network?).
-    echo [%date% %time%] FETCH FAILED >> "%LOGFILE%"
-    popd
-    goto :launch
-)
+:: If fetch failed, skip update and go straight to launch
+if !FETCH_ERR! neq 0 echo [%APP_NAME%] WARNING: Could not check for updates (no network?). & goto :update_done
 
 :: Compare local vs remote
 for /f "delims=" %%A in ('git rev-parse HEAD') do set "LOCAL_HASH=%%A"
 for /f "delims=" %%A in ('git rev-parse origin/%BRANCH%') do set "REMOTE_HASH=%%A"
-
 echo [%date% %time%] LOCAL:  !LOCAL_HASH! >> "%LOGFILE%"
 echo [%date% %time%] REMOTE: !REMOTE_HASH! >> "%LOGFILE%"
 
-if "!LOCAL_HASH!"=="!REMOTE_HASH!" (
-    echo [%APP_NAME%] Already up to date.
-    echo [%date% %time%] Already up to date >> "%LOGFILE%"
-    popd
-    goto :launch
-)
+:: If already up to date, skip update
+if "!LOCAL_HASH!"=="!REMOTE_HASH!" echo [%APP_NAME%] Already up to date. & goto :update_done
 
+:: Update available
 echo [%APP_NAME%] Update available — installing...
-echo [%date% %time%] Update available — running git reset --hard origin/%BRANCH% >> "%LOGFILE%"
-
-:: Kill running instance
+echo [%date% %time%] Update available >> "%LOGFILE%"
 taskkill /f /im "%EXE_NAME%" >nul 2>&1
-
-:: Pull latest (flat_field_norm.npy + .purexs_installed are in .gitignore, safe)
 git reset --hard origin/%BRANCH% >> "%LOGFILE%" 2>&1
 set "RESET_ERR=!errorlevel!"
-
-if !RESET_ERR! neq 0 (
-    echo [%APP_NAME%] WARNING: Update failed. Launching previous version...
-    echo [%date% %time%] RESET FAILED exit code: !RESET_ERR! >> "%LOGFILE%"
-    popd
-    goto :launch
-)
-
+if !RESET_ERR! neq 0 echo [%APP_NAME%] WARNING: Update failed. & goto :update_done
 echo [%APP_NAME%] Updated successfully.
 echo [%date% %time%] Updated successfully >> "%LOGFILE%"
 
 :: Re-install decoder deps in case requirements changed
-if defined PYTHON_CMD (
-    if exist "%DECODER_DIR%\requirements.txt" (
-        echo [%APP_NAME%] Updating decoder dependencies...
-        "%PYTHON_CMD%" -m pip install -r "%DECODER_DIR%\requirements.txt" --no-warn-script-location --quiet 2>nul
-    )
-)
+if defined PYTHON_CMD if exist "%DECODER_DIR%\requirements.txt" "%PYTHON_CMD%" -m pip install -r "%DECODER_DIR%\requirements.txt" --no-warn-script-location --quiet 2>nul
 
+:update_done
 popd
+echo [%date% %time%] Update check complete, proceeding to launch >> "%LOGFILE%"
 goto :launch
 
 :: ============================================================
