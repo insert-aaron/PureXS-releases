@@ -271,17 +271,19 @@ goto :launch
 pushd "%INSTALL_DIR%"
 
 echo [%date% %time%] State 3: check_update >> "%LOGFILE%"
-echo [%date% %time%] Running: git fetch origin %BRANCH% >> "%LOGFILE%"
 
-git fetch origin %BRANCH% 2>> "%LOGFILE%"
-if %errorlevel% neq 0 (
+:: Fetch and explicitly update the remote tracking ref (not just FETCH_HEAD)
+echo [%date% %time%] Running: git fetch origin %BRANCH%:refs/remotes/origin/%BRANCH% >> "%LOGFILE%"
+git fetch origin %BRANCH%:refs/remotes/origin/%BRANCH% >> "%LOGFILE%" 2>&1
+set "FETCH_ERR=!errorlevel!"
+echo [%date% %time%] Fetch exit code: !FETCH_ERR! >> "%LOGFILE%"
+
+if !FETCH_ERR! neq 0 (
     echo [%APP_NAME%] WARNING: Could not check for updates (no network?).
-    echo [%date% %time%] FETCH FAILED errorlevel=%errorlevel% >> "%LOGFILE%"
+    echo [%date% %time%] FETCH FAILED >> "%LOGFILE%"
     popd
     goto :launch
 )
-
-echo [%date% %time%] Fetch succeeded >> "%LOGFILE%"
 
 :: Compare local vs remote
 for /f "delims=" %%A in ('git rev-parse HEAD') do set "LOCAL_HASH=%%A"
@@ -292,7 +294,7 @@ echo [%date% %time%] REMOTE: !REMOTE_HASH! >> "%LOGFILE%"
 
 if "!LOCAL_HASH!"=="!REMOTE_HASH!" (
     echo [%APP_NAME%] Already up to date.
-    echo [%date% %time%] Already up to date — skipping pull >> "%LOGFILE%"
+    echo [%date% %time%] Already up to date >> "%LOGFILE%"
     popd
     goto :launch
 )
@@ -304,10 +306,12 @@ echo [%date% %time%] Update available — running git reset --hard origin/%BRANC
 taskkill /f /im "%EXE_NAME%" >nul 2>&1
 
 :: Pull latest (flat_field_norm.npy + .purexs_installed are in .gitignore, safe)
-git reset --hard origin/%BRANCH% 2>> "%LOGFILE%"
-if %errorlevel% neq 0 (
+git reset --hard origin/%BRANCH% >> "%LOGFILE%" 2>&1
+set "RESET_ERR=!errorlevel!"
+
+if !RESET_ERR! neq 0 (
     echo [%APP_NAME%] WARNING: Update failed. Launching previous version...
-    echo [%date% %time%] RESET FAILED errorlevel=%errorlevel% >> "%LOGFILE%"
+    echo [%date% %time%] RESET FAILED exit code: !RESET_ERR! >> "%LOGFILE%"
     popd
     goto :launch
 )
