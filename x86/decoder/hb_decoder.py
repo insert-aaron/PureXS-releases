@@ -2144,6 +2144,230 @@ def reconstruct_image(
     return img_pil
 
 
+def reconstruct_ceph_image(
+    scanlines: list[Scanline],
+    invert: bool = True,
+) -> Image.Image | None:
+    """Reconstruct a cephalometric image from decoded scanlines.
+
+    Uses the same lean pipeline as panoramic (dark correction, die junction,
+    row repair, percentile stretch, column normalization, CLAHE, sharpen)
+    but with ceph-specific geometry:
+      - No panoramic arc crop — the full rectangular field is preserved.
+      - Output is portrait orientation (height > width).
+      - Collimator crop is rectangular, not jaw-shaped.
+
+    The Orthophos XG ceph arm does a linear scan with the same 1316-row
+    detector, producing fewer scanlines than panoramic (shorter sweep).
+
+    Args:
+        scanlines: List of Scanline objects (one per column).
+        invert: If True (default), invert for radiographic convention.
+
+    Returns:
+        PIL Image (8-bit grayscale) or None.
+    """
+    if not scanlines:
+        return None
+
+    # Determine consistent pixel count (most common)
+    counts: dict[int, int] = {}
+    for sl in scanlines:
+        counts[sl.pixel_count] = counts.get(sl.pixel_count, 0) + 1
+    target_count = max(counts, key=counts.get)
+
+    valid = [sl for sl in scanlines if sl.pixel_count == target_count]
+    if not valid:
+        return None
+
+    log.info(
+        "Reconstructing CEPH image: %d scanlines x %d pixels",
+        len(valid), target_count,
+    )
+
+    width = len(valid)
+    height = target_count
+
+    img_array = np.zeros((height, width), dtype=np.uint16)
+    for col, sl in enumerate(valid):
+        img_array[:, col] = sl.pixels[:height]
+
+    img_f = img_array.astype(np.float32)
+
+    # ── Dark current correction (same as panoramic) ──────────────────
+    DARK_PRE_COLS = min(100, width // 10)
+    DARK_POST_COLS = min(25, width // 20)
+    if DARK_PRE_COLS >= 10 and DARK_POST_COLS >= 5:
+        from scipy.ndimage import uniform_filter1d as _uf1d
+        dark_pre = np.median(img_f[:, :DARK_PRE_COLS], axis=1)
+        dark_post = np.median(img_f[:, -DARK_POST_COLS:], axis=1)
+        dp_med = np.median(dark_pre)
+        dq_med = np.median(dark_post)
+        for r in range(height):
+            if abs(dark_pre[r] - dp_med) > 500:
+                dark_pre[r] = dp_med
+            if abs(dark_post[r] - dq_med) > 500:
+                dark_post[r] = dq_med
+        dark_pre = _uf1d(dark_pre, size=11)
+        dark_post = _uf1d(dark_post, size=11)
+        for c in range(width):
+            t = c / max(width - 1, 1)
+            img_f[:, c] -= dark_pre * (1 - t) + dark_post * t
+        img_f = np.maximum(img_f, 0)
+        log.info("CEPH dark correction: pre=%.0f, post=%.0f", dp_med, dq_med)
+
+    # ── Die junction stitching (same detector, same dies) ────────────
+    from scipy.ndimage import gaussian_filter1d as _gf1d
+    active_col_lo = max(width // 5, 20)
+    active_col_hi = min(width * 4 // 5, width - 20)
+    row_signal = np.mean(img_f[:, active_col_lo:active_col_hi], axis=1)
+    mid = height // 2
+
+    search_lo = height // 4
+    search_hi = height * 3 // 4
+    local_med = np.median(row_signal[search_lo:search_hi])
+    dead_threshold = local_med * 0.10
+    dead_mask = row_signal < dead_threshold
+    dead_indices = np.nonzero(dead_mask)[0]
+    central_dead = dead_indices[(dead_indices >= search_lo) &
+                                (dead_indices < search_hi)]
+
+    if len(central_dead) >= 1:
+        junction_row = int(np.median(central_dead))
+        gap_start = int(central_dead[0])
+        gap_end = int(central_dead[-1])
+        extend_thresh = local_med * 0.50
+        while gap_start > 1 and row_signal[gap_start - 1] < extend_thresh:
+            gap_start -= 1
+        while gap_end < height - 2 and row_signal[gap_end + 1] < extend_thresh:
+            gap_end += 1
+        ab = max(gap_start - 1, 0)
+        bl = min(gap_end + 1, height - 1)
+        for r in range(gap_start, gap_end + 1):
+            t = (r - gap_start + 1) / (gap_end - gap_start + 2)
+            img_f[r] = img_f[ab] * (1 - t) + img_f[bl] * t
+        log.info("CEPH die junction: row %d, interpolated %d-%d",
+                 junction_row, gap_start, gap_end)
+
+        STEP_W = 10
+        above_mean = np.mean(row_signal[max(0, gap_start - STEP_W):gap_start])
+        below_mean = np.mean(row_signal[gap_end + 1:min(height, gap_end + 1 + STEP_W)])
+        if above_mean > 10 and below_mean > 10:
+            step_ratio = above_mean / below_mean
+            step_pct = abs(step_ratio - 1.0) * 100
+            if step_pct > 3.0:
+                ratio = max(0.85, min(step_ratio, 1.20))
+                blend_half = 120
+                for r in range(height):
+                    dist = r - junction_row
+                    sigmoid = 1.0 / (1.0 + np.exp(-dist / (blend_half / 4)))
+                    img_f[r] *= 1.0 * (1 - sigmoid) + ratio * sigmoid
+                log.info("CEPH die gain correction %.3f (step=%.1f%%)",
+                         ratio, step_pct)
+
+    # ── Row repair (telemetry spikes + dead rows) ────────────────────
+    row_means = np.mean(img_f, axis=1)
+    global_med = np.median(row_means[row_means > 0]) if np.any(row_means > 0) else 1.0
+    spike_thresh = max(global_med * 0.05, 20)
+    spike_rows: set[int] = set()
+    for r in range(1, height - 1):
+        baseline = (row_means[r - 1] + row_means[r + 1]) / 2.0
+        spike = abs(row_means[r] - baseline)
+        if spike > spike_thresh and spike > abs(row_means[r - 1] - row_means[r + 1]) * 2 + 1:
+            spike_rows.add(r)
+
+    row_std = np.std(img_f, axis=1)
+    for r in range(height):
+        if row_std[r] < 5:
+            spike_rows.add(r)
+        elif row_means[r] > global_med * 5:
+            spike_rows.add(r)
+
+    for r in sorted(spike_rows):
+        above = r - 1
+        while above in spike_rows and above > 0:
+            above -= 1
+        below = r + 1
+        while below in spike_rows and below < height - 1:
+            below += 1
+        if (above >= 0 and below < height
+                and above not in spike_rows and below not in spike_rows):
+            t = (r - above) / max(below - above, 1)
+            img_f[r] = img_f[above] * (1 - t) + img_f[below] * t
+    if spike_rows:
+        log.info("CEPH row repair: %d rows interpolated", len(spike_rows))
+
+    # ── Percentile contrast stretch ──────────────────────────────────
+    nz = img_f[img_f > 0]
+    if len(nz) > 0:
+        low = np.percentile(nz, 2)
+        high = np.percentile(nz, 98)
+    else:
+        low, high = 0.0, 1.0
+    if high <= low:
+        high = low + 1
+    clipped = np.clip(img_f, low, high)
+    normalized = (clipped - low) / (high - low)
+
+    # ── Column gain normalization ────────────────────────────────────
+    from scipy.ndimage import gaussian_filter1d as _gf1d_col
+    _col_arr = (normalized * 255).astype(np.float32)
+    # For ceph, use a wider vertical band for column mean (more uniform field)
+    _row_lo = max(height // 6, 30)
+    _row_hi = min(height * 5 // 6, height - 30)
+    _col_means = _col_arr[_row_lo:_row_hi, :].mean(axis=0)
+    _col_smooth = _gf1d_col(_col_means.astype(np.float64), sigma=100)
+    _col_norm = _col_smooth.mean() / np.maximum(_col_smooth, 1.0)
+    normalized = np.clip(_col_arr * _col_norm[np.newaxis, :], 0, 255).astype(np.float32) / 255.0
+
+    if invert:
+        normalized = 1.0 - normalized
+
+    # ── CLAHE for local contrast ─────────────────────────────────────
+    img_16 = (normalized * 65535).astype(np.uint16)
+    try:
+        import cv2
+        clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(32, 32))
+        img_16 = clahe.apply(img_16)
+    except ImportError:
+        pass
+    img_8 = (img_16 >> 8).astype(np.uint8)
+
+    # ── Rectangular crop (ceph has no jaw-shaped collimator) ─────────
+    # Trim detector edges (dark/noisy border rows and pre/post dark columns).
+    # Keep the full active field — do NOT apply panoramic arc crop.
+    img_pil = Image.fromarray(img_8, mode="L")
+    margin_top = 18
+    margin_bot = min(height - 18, height)
+    margin_left = max(DARK_PRE_COLS + 10, 40)  # skip dark + transition cols
+    margin_right = max(width - DARK_POST_COLS - 5, width - 20)
+    if margin_bot > margin_top and margin_right > margin_left:
+        img_pil = img_pil.crop((margin_left, margin_top, margin_right, margin_bot))
+
+    # Ceph output: portrait orientation — rotate 90° CW so the
+    # vertical detector scan becomes the horizontal axis of the final
+    # image.  Standard ceph is ~2400 wide × ~3000 tall (portrait).
+    # The raw image is width=scanlines (short), height=detector_rows (1316).
+    # After crop, rotate so height becomes the long axis.
+    crop_w, crop_h = img_pil.size
+    if crop_h < crop_w:
+        # Already landscape from detector — rotate to portrait
+        img_pil = img_pil.transpose(Image.Transpose.ROTATE_270)
+
+    # ── Mild unsharp mask ────────────────────────────────────────────
+    try:
+        from PIL import ImageFilter
+        img_pil = img_pil.filter(
+            ImageFilter.UnsharpMask(radius=1, percent=60, threshold=3)
+        )
+    except Exception:
+        pass
+
+    log.info("CEPH reconstructed: %dx%d  percentile=[%.0f, %.0f]",
+             img_pil.width, img_pil.height, low, high)
+    return img_pil
+
+
 def save_scanline_pngs(
     scanlines: list[Scanline], outdir: Path
 ) -> list[Path]:
@@ -2721,23 +2945,57 @@ class SironaLiveClient:
 
     # ── Expose: arm + wait-for-button protocol ───────────────────────
 
-    # Continuation data sent immediately after DATA_SEND (102 bytes).
-    # This is the program/parameter table from ff.txt Sidexis capture.
-    _DATA_CONTINUATION = bytes([
-        0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x2c, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x2c, 0x00, 0x03, 0x00, 0x01,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x2c, 0x00, 0x01,
+    # Program codes matching ExposureProgram enum in orthophos_xg.py.
+    PROGRAM_PANORAMIC       = 0x01
+    PROGRAM_CEPH_LATERAL    = 0x02
+    PROGRAM_CEPH_FRONTAL    = 0x03
+
+    # Maps user-facing exam type strings to DX81RecordingMode program codes.
+    _EXAM_TYPE_TO_PROGRAM: dict[str, int] = {
+        "Panoramic":      0x01,
+        "Ceph Lateral":   0x02,
+        "Ceph Frontal":   0x03,
+    }
+
+    # Base continuation data sent immediately after DATA_SEND (98 bytes).
+    # Contains 5 binning groups + program/position parameters.
+    # Byte 58-59 = DX81RecordingMode (big-endian uint16) — patched per exam type.
+    _DATA_CONTINUATION_BASE = bytearray([
+        # 5 binning groups (RecordKind, ScanSpeed, Szint, FIFO, Binning) × 10B
+        0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,  # PAN, speed=1
+        0x00, 0x2c, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00,  # CEPH_LAT, speed=1
+        0x00, 0x00, 0x00, 0x2c, 0x00, 0x03, 0x00, 0x01,  # CEPH_FRONT, speed=1
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x2c, 0x00, 0x01,  # PAN, speed=2
         0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2c,
-        0x00, 0x02, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x2c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04,
-        0x00, 0x08, 0x00, 0x01, 0x00, 0x0a, 0x00, 0x03,
+        0x00, 0x02, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00,  # CEPH_LAT, speed=2
+        0x00, 0x2c,
+        # SequenceID(DW) + SliceMode + RecordingKind
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x08,
+        # DX81RecordingMode (byte 58-59) — 0x0001=PAN, 0x0002=CEPH_LAT, 0x0003=CEPH_FRONT
+        0x00, 0x01,
+        # DX11RecordingMode + remaining position/jaw params
+        0x00, 0x0a, 0x00, 0x03,
         0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x05, 0x00, 0x00, 0x00, 0x02, 0xff, 0xff,
         0x00, 0x03, 0x00, 0x03, 0x00, 0x00, 0x00, 0x05,
         0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05,
         0xff, 0xff, 0x00, 0x05, 0xff, 0xff,
     ])
+
+    # Offset of DX81RecordingMode in _DATA_CONTINUATION_BASE (big-endian uint16).
+    _RECORDING_MODE_OFFSET = 58
+
+    @classmethod
+    def _build_data_continuation(cls, program: int = 0x01) -> bytes:
+        """Build the DATA_SEND continuation with the specified program code.
+
+        Args:
+            program: DX81RecordingMode — 0x01=Panoramic, 0x02=Ceph Lateral,
+                     0x03=Ceph Frontal.
+        """
+        buf = bytearray(cls._DATA_CONTINUATION_BASE)
+        struct.pack_into(">H", buf, cls._RECORDING_MODE_OFFSET, program)
+        return bytes(buf)
 
     @staticmethod
     def _encode_utf16le_field(text: str) -> bytes:
@@ -2790,6 +3048,7 @@ class SironaLiveClient:
         doctor: str = "Dr. Demo",
         study_id: str = "",
         workstation: str = "PUREXS",
+        exam_type: str = "Panoramic",
     ) -> None:
         """Arm the device for exposure: CAPS exchange + patient DATA_SEND.
 
@@ -2800,6 +3059,10 @@ class SironaLiveClient:
 
         The device will send FC_EXPOSE_NOTIFY (0x1005) when the operator
         presses the button, followed by kV ramp data and scanline images.
+
+        Args:
+            exam_type: One of "Panoramic", "Ceph Lateral", "Ceph Frontal".
+                       Controls the DX81RecordingMode sent to the device.
 
         Raises:
             ConnectionError: Socket not connected.
@@ -2836,12 +3099,16 @@ class SironaLiveClient:
                 )
 
             # 2. DATA_SEND (patient + exam info)
+            program = self._EXAM_TYPE_TO_PROGRAM.get(exam_type, self.PROGRAM_PANORAMIC)
+            log.info("Exam type: %s → program=0x%02X", exam_type, program)
+
             payload = self._build_patient_payload(
                 last_name, first_name, doctor, study_id, workstation,
             )
+            continuation = self._build_data_continuation(program)
             # Header payload_length must cover BOTH the payload AND the
             # continuation data that follows in a separate TCP segment.
-            total_len = len(payload) + len(self._DATA_CONTINUATION)
+            total_len = len(payload) + len(continuation)
             self._send_data_frame(
                 FC_DATA_SEND, payload, total_payload_length=total_len,
             )
@@ -2851,8 +3118,9 @@ class SironaLiveClient:
             )
 
             # 3. Continuation data (program parameters)
-            self._sock.sendall(self._DATA_CONTINUATION)
-            log.info("DATA continuation: %d bytes", len(self._DATA_CONTINUATION))
+            self._sock.sendall(continuation)
+            log.info("DATA continuation: %d bytes (program=0x%02X)",
+                     len(continuation), program)
 
             # 4. Wait for DATA_ACK (0x1001)
             ack_resp = self._recv_frame()

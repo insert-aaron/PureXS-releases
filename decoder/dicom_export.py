@@ -169,10 +169,12 @@ class PureXSDICOM:
         ds.AccessionNumber = ""
 
         # ── General Series Module (C.7.3.1) ───────────────────────────────
-        ds.Modality = "PX"  # Panoramic X-Ray
+        exam = patient.get("exam", "Panoramic")
+        is_ceph = exam.startswith("Ceph")
+        ds.Modality = "DX" if is_ceph else "PX"  # DX for ceph, PX for panoramic
         ds.SeriesInstanceUID = series_uid
         ds.SeriesNumber = 1
-        ds.SeriesDescription = patient.get("exam", "Panoramic")
+        ds.SeriesDescription = exam
 
         # ── General Equipment Module (C.7.5.1) ────────────────────────────
         ds.Manufacturer = "Dentsply Sirona"
@@ -209,10 +211,11 @@ class PureXSDICOM:
         ds.KVP = f"{kv_peak:.1f}"
         ds.ExposureTime = str(exposure_time_ms)
         ds.Exposure = str(int(kv_peak * 8))  # mAs estimate
-        ds.BodyPartExamined = "JAW"
-        ds.ViewPosition = "PA"
-        ds.DistanceSourceToDetector = "500"  # mm, typical Orthophos
-        ds.DistanceSourceToPatient = "400"   # mm, typical
+        ds.BodyPartExamined = "SKULL" if is_ceph else "JAW"
+        view_positions = {"Ceph Lateral": "LAT", "Ceph Frontal": "AP"}
+        ds.ViewPosition = view_positions.get(exam, "PA")
+        ds.DistanceSourceToDetector = "1500" if is_ceph else "500"  # mm, ceph uses longer SID
+        ds.DistanceSourceToPatient = "1350" if is_ceph else "400"   # mm
 
         # ── SOP Common Module (C.12.1) ────────────────────────────────────
         ds.SOPClassUID = DX_SOP_CLASS_UID
@@ -337,10 +340,12 @@ class PureXSDICOM:
         ds.ReferringPhysicianName = ""
         ds.StudyID = patient.get("id", "")
         ds.AccessionNumber = ""
-        ds.Modality = "PX"
+        exam = patient.get("exam", "Panoramic")
+        is_ceph = exam.startswith("Ceph")
+        ds.Modality = "DX" if is_ceph else "PX"
         ds.SeriesInstanceUID = generate_uid()
         ds.SeriesNumber = 1
-        ds.SeriesDescription = patient.get("exam", "Panoramic")
+        ds.SeriesDescription = exam
 
         # Equipment
         ds.Manufacturer = "Dentsply Sirona"
@@ -378,10 +383,11 @@ class PureXSDICOM:
         # DX-specific
         ds.KVP = f"{kv_peak:.1f}"
         ds.ExposureTime = str(exposure_time_ms)
-        ds.BodyPartExamined = "JAW"
-        ds.ViewPosition = "PA"
-        ds.DistanceSourceToDetector = "500"
-        ds.DistanceSourceToPatient = "400"
+        ds.BodyPartExamined = "SKULL" if is_ceph else "JAW"
+        view_positions = {"Ceph Lateral": "LAT", "Ceph Frontal": "AP"}
+        ds.ViewPosition = view_positions.get(exam, "PA")
+        ds.DistanceSourceToDetector = "1500" if is_ceph else "500"
+        ds.DistanceSourceToPatient = "1350" if is_ceph else "400"
 
         # SOP Common
         ds.SOPClassUID = DX_SOP_CLASS_UID

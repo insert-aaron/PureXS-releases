@@ -21,12 +21,17 @@ _SCRIPT_DIR = Path(__file__).resolve().parent
 if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
-from hb_decoder import _extract_panoramic, _extract_panoramic_simple, reconstruct_image
+from hb_decoder import (
+    _extract_panoramic, _extract_panoramic_simple,
+    reconstruct_image, reconstruct_ceph_image,
+)
 
 log = logging.getLogger("purexs_decoder_cli")
 
+_CEPH_TYPES = {"Ceph Lateral", "Ceph Frontal"}
 
-def process_raw(input_path: Path, output_path: Path) -> int:
+
+def process_raw(input_path: Path, output_path: Path, exam_type: str = "Panoramic") -> int:
     """Read raw scan bytes, decode scanlines, reconstruct, and save PNG."""
     raw = input_path.read_bytes()
     if len(raw) < 10_000:
@@ -52,22 +57,27 @@ def process_raw(input_path: Path, output_path: Path) -> int:
         log.error("Could not extract any scanlines from input")
         return 1
 
-    log.info("Extracted %d scanlines, reconstructing panoramic...", len(scanlines))
-    img = reconstruct_image(scanlines, repair_mask=repair_mask)
+    log.info("Extracted %d scanlines, reconstructing %s...", len(scanlines), exam_type)
+
+    if exam_type in _CEPH_TYPES:
+        img = reconstruct_ceph_image(scanlines)
+    else:
+        img = reconstruct_image(scanlines, repair_mask=repair_mask)
+
     if img is None:
-        log.error("reconstruct_image returned None")
+        log.error("Reconstruction returned None")
         return 1
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     img.save(str(output_path), "PNG")
-    log.info("Saved %dx%d panoramic to %s", img.width, img.height, output_path)
+    log.info("Saved %dx%d %s to %s", img.width, img.height, exam_type, output_path)
     return 0
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="purexs_decoder",
-        description="PureXS Decoder — raw scan bytes to panoramic PNG",
+        description="PureXS Decoder — raw scan bytes to finished PNG",
     )
     parser.add_argument(
         "--input", "-i", required=True, type=Path,
@@ -75,7 +85,12 @@ def main() -> None:
     )
     parser.add_argument(
         "--output", "-o", required=True, type=Path,
-        help="Path for output panoramic .png",
+        help="Path for output .png",
+    )
+    parser.add_argument(
+        "--exam-type", "-e", default="Panoramic",
+        choices=["Panoramic", "Ceph Lateral", "Ceph Frontal"],
+        help="Exam type for reconstruction pipeline routing",
     )
     parser.add_argument(
         "--verbose", "-v", action="store_true",
@@ -88,7 +103,7 @@ def main() -> None:
         format="[%(levelname)s] %(message)s",
     )
 
-    sys.exit(process_raw(args.input, args.output))
+    sys.exit(process_raw(args.input, args.output, args.exam_type))
 
 
 if __name__ == "__main__":
