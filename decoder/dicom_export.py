@@ -217,6 +217,14 @@ class PureXSDICOM:
         ds.DistanceSourceToDetector = "1500" if is_ceph else "500"  # mm, ceph uses longer SID
         ds.DistanceSourceToPatient = "1350" if is_ceph else "400"   # mm
 
+        # ── Pixel spacing & detector (from Sidexis reference DICOM) ───────
+        if is_ceph:
+            ds.PixelSpacing = [0.094549, 0.094549]         # calibrated at mid-plane
+            ds.ImagerPixelSpacing = [0.104004, 0.104004]   # detector native
+            ds.DetectorType = "SCINTILLATOR"
+            ds.PatientOrientation = ["A", "F"]             # Anterior/Feet (lateral)
+            ds.PresentationIntentType = "FOR PRESENTATION"
+
         # ── SOP Common Module (C.12.1) ────────────────────────────────────
         ds.SOPClassUID = DX_SOP_CLASS_UID
         ds.SOPInstanceUID = file_meta.MediaStorageSOPInstanceUID
@@ -388,6 +396,14 @@ class PureXSDICOM:
         ds.ViewPosition = view_positions.get(exam, "PA")
         ds.DistanceSourceToDetector = "1500" if is_ceph else "500"
         ds.DistanceSourceToPatient = "1350" if is_ceph else "400"
+
+        # Pixel spacing & detector (from Sidexis reference DICOM)
+        if is_ceph:
+            ds.PixelSpacing = [0.094549, 0.094549]
+            ds.ImagerPixelSpacing = [0.104004, 0.104004]
+            ds.DetectorType = "SCINTILLATOR"
+            ds.PatientOrientation = ["A", "F"]
+            ds.PresentationIntentType = "FOR PRESENTATION"
 
         # SOP Common
         ds.SOPClassUID = DX_SOP_CLASS_UID

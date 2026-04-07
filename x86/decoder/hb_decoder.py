@@ -2344,15 +2344,19 @@ def reconstruct_ceph_image(
     if margin_bot > margin_top and margin_right > margin_left:
         img_pil = img_pil.crop((margin_left, margin_top, margin_right, margin_bot))
 
-    # Ceph output: portrait orientation — rotate 90° CW so the
-    # vertical detector scan becomes the horizontal axis of the final
-    # image.  Standard ceph is ~2400 wide × ~3000 tall (portrait).
-    # The raw image is width=scanlines (short), height=detector_rows (1316).
-    # After crop, rotate so height becomes the long axis.
+    # Ceph output: portrait orientation.
+    # The raw image is width=scanlines, height=detector_rows (1316).
+    # Sidexis reference ceph output: 2136 × 1804 (H × W portrait).
+    # After crop, the image is landscape (detector height < scanline count).
+    # Rotate 90° CW so detector rows become width, scanlines become height.
+    CEPH_TARGET_H = 2136  # Sidexis reference: rows
+    CEPH_TARGET_W = 1804  # Sidexis reference: cols
     crop_w, crop_h = img_pil.size
     if crop_h < crop_w:
-        # Already landscape from detector — rotate to portrait
+        # Landscape from detector — rotate to portrait
         img_pil = img_pil.transpose(Image.Transpose.ROTATE_270)
+    # Resize to Sidexis-matched output dimensions
+    img_pil = img_pil.resize((CEPH_TARGET_W, CEPH_TARGET_H), Image.Resampling.LANCZOS)
 
     # ── Mild unsharp mask ────────────────────────────────────────────
     try:
