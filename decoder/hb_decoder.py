@@ -1973,6 +1973,37 @@ def reconstruct_image(
         log.info("Dark correction: pre=%.0f, post=%.0f, drift=%.0f",
                  dp_med, dq_med, dq_med - dp_med)
 
+    # ── Exposure boundary detection ───────────────────────────────────
+    # Pre/post-exposure columns (no beam) and top/bottom collimator rows
+    # have near-zero signal after dark correction. If not masked, the
+    # final invert flips them to pure white, producing blown-out edges.
+    # Walk in from each edge until we hit a column/row with real signal.
+    _col_means = np.mean(img_f, axis=0)
+    _col_peak = float(np.max(_col_means)) if _col_means.size else 1.0
+    _col_thresh = max(_col_peak * 0.08, 1.0)
+    _exp_col_lo = 0
+    while _exp_col_lo < width - 1 and _col_means[_exp_col_lo] < _col_thresh:
+        _exp_col_lo += 1
+    _exp_col_hi = width - 1
+    while _exp_col_hi > 0 and _col_means[_exp_col_hi] < _col_thresh:
+        _exp_col_hi -= 1
+    # Row bounds computed over active columns only so pre-exposure
+    # columns don't drag the row mean below threshold near the edges.
+    if _exp_col_hi > _exp_col_lo:
+        _row_means = np.mean(img_f[:, _exp_col_lo:_exp_col_hi + 1], axis=1)
+    else:
+        _row_means = np.mean(img_f, axis=1)
+    _row_peak = float(np.max(_row_means)) if _row_means.size else 1.0
+    _row_thresh = max(_row_peak * 0.08, 1.0)
+    _exp_row_lo = 0
+    while _exp_row_lo < height - 1 and _row_means[_exp_row_lo] < _row_thresh:
+        _exp_row_lo += 1
+    _exp_row_hi = height - 1
+    while _exp_row_hi > 0 and _row_means[_exp_row_hi] < _row_thresh:
+        _exp_row_hi -= 1
+    log.info("Exposure bounds: cols [%d, %d], rows [%d, %d]",
+             _exp_col_lo, _exp_col_hi, _exp_row_lo, _exp_row_hi)
+
     # ── Die junction stitching ────────────────────────────────────────
     #   The DX41 detector has two vertically stacked CMOS dies.  They
     #   may have a dead-row gap AND/OR a gain mismatch.
@@ -2116,16 +2147,24 @@ def reconstruct_image(
     img_16 = (normalized * 65535).astype(np.uint16)
     try:
         import cv2
-        clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(32, 32))
+        # Light pre-CLAHE smoothing reduces shot-noise amplification,
+        # larger tiles + softer clip keep contrast without graininess.
+        img_16 = cv2.GaussianBlur(img_16, (0, 0), sigmaX=0.6)
+        clahe = cv2.createCLAHE(clipLimit=1.0, tileGridSize=(48, 48))
         img_16 = clahe.apply(img_16)
     except ImportError:
         pass
     img_8 = (img_16 >> 8).astype(np.uint8)
 
-    # ── Zoom crop — preserve full arch + TMJ condyles ────────────────
+    # ── Zoom crop — use detected exposure bounds + fade margin ───────
+    # Inset from the detected exposure region to guarantee we crop past
+    # any residual zero-signal fringe that would invert to bright white.
     img_pil = Image.fromarray(img_8, mode="L")
-    crop_t, crop_b = 20, min(760, height)
-    crop_l, crop_r = 40, min(2440, width)
+    INSET = 8
+    crop_t = max(_exp_row_lo + INSET, 0)
+    crop_b = min(_exp_row_hi - INSET, height)
+    crop_l = max(_exp_col_lo + INSET, 0)
+    crop_r = min(_exp_col_hi - INSET, width)
     if crop_b > crop_t and crop_r > crop_l:
         img_pil = img_pil.crop((crop_l, crop_t, crop_r, crop_b))
         img_pil = img_pil.resize((2440, 1280), Image.Resampling.LANCZOS)
