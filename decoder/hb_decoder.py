@@ -2200,44 +2200,185 @@ def reconstruct_image(
     grad_indices = np.where(gradient_mask)[0]
     if len(grad_indices) >= 3:
         spacings = np.diff(grad_indices)
-        # Keep only the dominant spacing (filter out doubled/adjacent hits)
+        # Keep spacings in the plausible hardware-batch range
         valid_spacings = spacings[(spacings > 50) & (spacings < 500)]
         if len(valid_spacings) >= 2:
-            period = int(np.median(valid_spacings))
-            # Sanity check: period should be stable (low variance)
-            if np.std(valid_spacings) < period * 0.15:
-                first = int(grad_indices[0])
-                last_detected = int(grad_indices[-1])
-                # Extrapolate forward from the last detected seam
-                c = last_detected + period
-                extrapolated = 0
-                while c < width:
-                    # Mark a ±1 col window to absorb period jitter
-                    for cc in (c - 1, c, c + 1):
-                        if 0 <= cc < width:
-                            seam_mask[cc] = True
-                    extrapolated += 1
-                    c += period
-                if extrapolated > 0:
-                    log.info("Column seam: extrapolated %d additional seams at period=%d",
-                             extrapolated, period)
+            # Mode-based period detection: cluster spacings into ±5-col buckets,
+            # use the most populous bucket. Robust against noise-cluster outliers
+            # (e.g. adjacent false positives at col 292/297/307/317 that would
+            # poison a median-based estimate with spurious short gaps).
+            bucket_size = 5
+            buckets: dict[int, list[int]] = {}
+            for sp in valid_spacings:
+                key = int(round(sp / bucket_size) * bucket_size)
+                buckets.setdefault(key, []).append(int(sp))
+            dominant_key = max(buckets.keys(), key=lambda k: len(buckets[k]))
+            dominant_hits = buckets[dominant_key]
+            # Require at least 2 spacings in the dominant bucket to trust the period
+            if len(dominant_hits) >= 2:
+                period = int(np.median(dominant_hits))
+                # Find the earliest grad_index that matches the dominant period
+                # (so we anchor extrapolation on a real seam, not a noise-cluster col)
+                anchor = None
+                for i in range(len(grad_indices) - 1):
+                    sp = int(grad_indices[i + 1] - grad_indices[i])
+                    if abs(sp - period) <= bucket_size:
+                        anchor = int(grad_indices[i])
+                        break
+                if anchor is not None:
+                    # Extrapolate BOTH directions from the anchor to catch seams
+                    # beyond the detection range on either side.
+                    extrapolated = 0
+                    # Forward
+                    c = anchor + period
+                    while c < width:
+                        for cc in (c - 1, c, c + 1):
+                            if 0 <= cc < width and not seam_mask[cc]:
+                                seam_mask[cc] = True
+                                extrapolated += 1
+                        c += period
+                    # Backward
+                    c = anchor - period
+                    while c >= 0:
+                        for cc in (c - 1, c, c + 1):
+                            if 0 <= cc < width and not seam_mask[cc]:
+                                seam_mask[cc] = True
+                                extrapolated += 1
+                        c -= period
+                    if extrapolated > 0:
+                        log.info("Column seam: extrapolated %d cols at period=%d (anchor=%d)",
+                                 extrapolated, period, anchor)
 
-    # Correction: multiplicative toward local tonal median.
+    # ── Row-shift correction — align each scanline batch vertically ──
+    # The hardware produces ~249-col scanline batches; adjacent batches are
+    # vertically offset by ±1-6 rows (spatial jitter, not a tonal issue).
+    # Cross-correlate a strip on each side of every seam to measure the shift,
+    # then roll each batch to align all of them to the median coordinate frame.
+    # Group consecutive seam cols into single boundary indices.
+    _seam_positions = sorted(int(x) for x in np.where(seam_mask)[0])
+    _grouped_seams: list[int] = []
+    if _seam_positions:
+        _run = [_seam_positions[0]]
+        for s in _seam_positions[1:]:
+            if s - _run[-1] <= 5:
+                _run.append(s)
+            else:
+                _grouped_seams.append(int(np.mean(_run)))
+                _run = [s]
+        _grouped_seams.append(int(np.mean(_run)))
+
+    if len(_grouped_seams) >= 2:
+        MAX_SHIFT = 6
+        STRIP_W = 10   # cols on each side of seam used for correlation
+        STRIP_GAP = 3  # skip cols immediately adjacent to seam (distorted)
+
+        MIN_CORR = 0.55   # below this, trust no shift (avoids noise-driven bogus dys)
+        DAMPEN = 0.75     # apply 75% of measured shift to stay conservative
+
+        def _measure_shift(sp: int) -> tuple[float, float]:
+            """Return (sub-pixel dy, peak correlation) for the given seam column."""
+            left_lo = max(sp - STRIP_W - STRIP_GAP, 0)
+            left_hi = max(sp - STRIP_GAP, 0)
+            right_lo = min(sp + STRIP_GAP, width)
+            right_hi = min(sp + STRIP_W + STRIP_GAP, width)
+            if left_hi - left_lo < 3 or right_hi - right_lo < 3:
+                return 0.0, 0.0
+            left_sig = normalized[_grad_row_lo:_grad_row_hi, left_lo:left_hi].mean(axis=1)
+            right_sig = normalized[_grad_row_lo:_grad_row_hi, right_lo:right_hi].mean(axis=1)
+            L = len(left_sig)
+            corrs: dict[int, float] = {}
+            for dy in range(-MAX_SHIFT, MAX_SHIFT + 1):
+                if dy == 0:
+                    a, b = left_sig, right_sig
+                elif dy > 0:
+                    a, b = left_sig[dy:], right_sig[:L - dy]
+                else:
+                    a, b = left_sig[:L + dy], right_sig[-dy:]
+                if len(a) < 100:
+                    continue
+                a_c = a - a.mean()
+                b_c = b - b.mean()
+                denom = float(np.sqrt((a_c ** 2).sum() * (b_c ** 2).sum()))
+                if denom < 1e-6:
+                    continue
+                corrs[dy] = float((a_c * b_c).sum() / denom)
+            if not corrs:
+                return 0.0, 0.0
+            best_dy = max(corrs, key=corrs.get)
+            best_corr = corrs[best_dy]
+            # Parabolic interpolation around the integer peak for sub-pixel accuracy
+            if best_dy - 1 in corrs and best_dy + 1 in corrs:
+                y0 = corrs[best_dy - 1]
+                y1 = corrs[best_dy]
+                y2 = corrs[best_dy + 1]
+                denom_p = (y0 - 2 * y1 + y2)
+                if abs(denom_p) > 1e-9:
+                    offset = 0.5 * (y0 - y2) / denom_p
+                    offset = max(-0.5, min(0.5, offset))  # clamp to [-0.5, +0.5]
+                    return float(best_dy) + offset, best_corr
+            return float(best_dy), best_corr
+
+        # Measure each seam; gate by correlation confidence
+        _measurements = [_measure_shift(sp) for sp in _grouped_seams]
+        _dys = [(d if c >= MIN_CORR else 0.0) * DAMPEN for d, c in _measurements]
+        _confs = [c for _, c in _measurements]
+
+        # Cumulative offsets per batch (N_batches = N_seams + 1)
+        _cumulative = np.zeros(len(_grouped_seams) + 1, dtype=np.float64)
+        for i, dy in enumerate(_dys):
+            _cumulative[i + 1] = _cumulative[i] + float(dy)
+
+        # Anchor at median batch so we shift as little as possible overall
+        _anchor = float(np.median(_cumulative))
+        _shifts = _cumulative - _anchor
+
+        # Apply sub-pixel shifts using scipy.ndimage.shift (cubic interp).
+        # Nearest-edge extension avoids black bands and horizontal stairstep at edges.
+        from scipy.ndimage import shift as _ndshift
+        _batch_starts = [0] + [s + 1 for s in _grouped_seams]
+        _batch_ends = list(_grouped_seams) + [width]
+        for _bi, (_start, _end) in enumerate(zip(_batch_starts, _batch_ends)):
+            _sh = float(_shifts[_bi])
+            if abs(_sh) < 0.05 or _end <= _start:
+                continue
+            _batch = normalized[:, _start:_end]
+            # Shift rows by _sh (positive = down), cubic interp, nearest-edge boundary.
+            normalized[:, _start:_end] = _ndshift(
+                _batch, shift=(_sh, 0), order=3, mode="nearest", prefilter=True
+            ).astype(np.float32)
+
+        log.info(
+            "Row-shift correction: %d batches, dys=%s, confs=%s, cumulative=%s",
+            len(_batch_starts),
+            [f"{d:+.2f}" for d in _dys],
+            [f"{c:.2f}" for c in _confs],
+            [f"{s:+.2f}" for s in _shifts.tolist()],
+        )
+
+    # Tonal correction — multiplicative ratio toward local median. Helpful for
+    # residual brightness-shift seams; harmless on spatial seams (ratio ~1).
     col_ratio_seam = col_local_median / np.maximum(col_means2, 1.0)
     col_ratio_seam = np.clip(col_ratio_seam, 0.85, 1.15)
     correction = np.ones_like(col_ratio_seam, dtype=np.float32)
     correction[seam_mask] = col_ratio_seam[seam_mask].astype(np.float32)
     normalized = np.clip(normalized * correction[np.newaxis, :], 0.0, 1.0)
 
-    # For pure-gradient seams, tonal correction won't help (mean was already right).
-    # Add a targeted horizontal smoothing step at those exact columns: replace the
-    # seam column with the average of its two neighbors. Preserves anatomy elsewhere.
-    grad_only = gradient_mask & ~tonal_mask
-    if grad_only.any():
-        grad_cols = np.where(grad_only)[0]
-        for c in grad_cols:
-            if 0 < c < width - 1:
-                normalized[:, c] = 0.5 * (normalized[:, c - 1] + normalized[:, c + 1])
+    # Spatial smoothing — even after row-shift alignment, single-col seam artifacts
+    # (e.g. at the exact boundary pixel) remain. Replace each seam col with a
+    # blend of the nearest non-seam neighbors on each side.
+    BLEND_HALF = 3
+    if seam_mask.any():
+        for c in np.where(seam_mask)[0]:
+            left = c - 1
+            while 0 <= left and seam_mask[left] and (c - left) <= BLEND_HALF:
+                left -= 1
+            right = c + 1
+            while right < width and seam_mask[right] and (right - c) <= BLEND_HALF:
+                right += 1
+            if left < 0 or right >= width:
+                continue
+            t = (c - left) / max(right - left, 1)
+            normalized[:, c] = normalized[:, left] * (1 - t) + normalized[:, right] * t
 
     num_seams = int(seam_mask.sum())
     if num_seams > 0:
