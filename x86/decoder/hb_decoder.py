@@ -2272,8 +2272,8 @@ def reconstruct_image(
         STRIP_W = 10   # cols on each side of seam used for correlation
         STRIP_GAP = 3  # skip cols immediately adjacent to seam (distorted)
 
-        MIN_CORR = 0.55   # below this, trust no shift (avoids noise-driven bogus dys)
-        DAMPEN = 0.75     # apply 75% of measured shift to stay conservative
+        MIN_CORR = 0.45   # below this, trust no shift (avoids noise-driven bogus dys)
+        DAMPEN = 1.0      # apply full measured shift — dampening leaves residual seams
 
         def _measure_shift(sp: int) -> tuple[float, float]:
             """Return (sub-pixel dy, peak correlation) for the given seam column."""
@@ -2318,38 +2318,37 @@ def reconstruct_image(
                     return float(best_dy) + offset, best_corr
             return float(best_dy), best_corr
 
-        # Measure each seam; gate by correlation confidence
-        _measurements = [_measure_shift(sp) for sp in _grouped_seams]
-        _dys = [(d if c >= MIN_CORR else 0.0) * DAMPEN for d, c in _measurements]
-        _confs = [c for _, c in _measurements]
-
-        # Cumulative offsets per batch (N_batches = N_seams + 1)
-        _cumulative = np.zeros(len(_grouped_seams) + 1, dtype=np.float64)
-        for i, dy in enumerate(_dys):
-            _cumulative[i + 1] = _cumulative[i] + float(dy)
-
-        # Anchor at median batch so we shift as little as possible overall
-        _anchor = float(np.median(_cumulative))
-        _shifts = _cumulative - _anchor
-
-        # Apply sub-pixel shifts using scipy.ndimage.shift (cubic interp).
-        # Nearest-edge extension avoids black bands and horizontal stairstep at edges.
         from scipy.ndimage import shift as _ndshift
         _batch_starts = [0] + [s + 1 for s in _grouped_seams]
         _batch_ends = list(_grouped_seams) + [width]
-        for _bi, (_start, _end) in enumerate(zip(_batch_starts, _batch_ends)):
-            _sh = float(_shifts[_bi])
-            if abs(_sh) < 0.05 or _end <= _start:
-                continue
-            _batch = normalized[:, _start:_end]
-            # Shift rows by _sh (positive = down), cubic interp, nearest-edge boundary.
-            normalized[:, _start:_end] = _ndshift(
-                _batch, shift=(_sh, 0), order=3, mode="nearest", prefilter=True
-            ).astype(np.float32)
 
+        def _apply_pass(pass_label: str) -> tuple[list[float], list[float], np.ndarray]:
+            """Measure shifts at every seam, compute cumulative per-batch offsets
+            (anchored at median), and roll each batch vertically. Returns the
+            measured dys, confidences, and applied shifts for logging."""
+            measurements = [_measure_shift(sp) for sp in _grouped_seams]
+            dys = [(d if c >= MIN_CORR else 0.0) * DAMPEN for d, c in measurements]
+            confs = [c for _, c in measurements]
+
+            cumulative = np.zeros(len(_grouped_seams) + 1, dtype=np.float64)
+            for i, dy in enumerate(dys):
+                cumulative[i + 1] = cumulative[i] + float(dy)
+            anchor = float(np.median(cumulative))
+            shifts = cumulative - anchor
+
+            for bi, (start, end) in enumerate(zip(_batch_starts, _batch_ends)):
+                sh = float(shifts[bi])
+                if abs(sh) < 0.05 or end <= start:
+                    continue
+                batch = normalized[:, start:end]
+                normalized[:, start:end] = _ndshift(
+                    batch, shift=(sh, 0), order=3, mode="nearest", prefilter=True
+                ).astype(np.float32)
+            return dys, confs, shifts
+
+        _dys, _confs, _shifts = _apply_pass("main")
         log.info(
-            "Row-shift correction: %d batches, dys=%s, confs=%s, cumulative=%s",
-            len(_batch_starts),
+            "Row-shift correction: dys=%s confs=%s shifts=%s",
             [f"{d:+.2f}" for d in _dys],
             [f"{c:.2f}" for c in _confs],
             [f"{s:+.2f}" for s in _shifts.tolist()],
