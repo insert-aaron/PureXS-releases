@@ -2133,12 +2133,129 @@ def reconstruct_image(
     normalized = (clipped - low) / (high - low)
 
     # ── Column gain normalization ────────────────────────────────────
+    # Two-stage: wide Gaussian flat-field (low-freq banding) plus a
+    # narrow pass that catches single-column spikes (the vertical-line
+    # misalignment visible across the whole panoramic).
     from scipy.ndimage import gaussian_filter1d as _gf1d_col
     _col_arr = (normalized * 255).astype(np.float32)
-    _col_means = _col_arr[50:650, :].mean(axis=0)
-    _col_smooth = _gf1d_col(_col_means.astype(np.float64), sigma=150)
-    _col_norm = _col_smooth.mean() / np.maximum(_col_smooth, 1.0)
+    _col_means = _col_arr[50:650, :].mean(axis=0).astype(np.float64)
+
+    # Wide pass — corrects broad per-column gain drift without flattening anatomy
+    _col_wide = _gf1d_col(_col_means, sigma=80)
+    _col_norm_wide = _col_wide.mean() / np.maximum(_col_wide, 1.0)
+    _col_norm_wide = np.clip(_col_norm_wide, 0.85, 1.15)
+
+    # Narrow pass — ratio of raw column mean to smoothed neighborhood,
+    # targets single-column brightness spikes (sharp vertical lines).
+    _col_local = _gf1d_col(_col_means, sigma=6)
+    _col_ratio = _col_local / np.maximum(_col_means, 1.0)
+    _col_ratio = np.clip(_col_ratio, 0.75, 1.25)
+
+    _col_norm = _col_norm_wide * _col_ratio
     normalized = np.clip(_col_arr * _col_norm[np.newaxis, :], 0, 255).astype(np.float32) / 255.0
+
+    # ── Column-seam repair — flatten sustained column-boundary artifacts ──
+    # The narrow vertical seams that survive gain normalization are typically
+    # 2-5 columns wide (not single-pixel spikes), caused by _calibration_driven_fill
+    # placing telemetry replacements at column-merge boundaries. Detect columns
+    # whose mean deviates from a rolling-window median, then correct them with
+    # a multiplicative ratio (preserves anatomy, fixes the seam).
+    _col_arr2 = normalized * 255.0
+    col_means2 = _col_arr2[50:650, :].mean(axis=0).astype(np.float64)
+
+    # Dual detector: tonal + gradient.
+    #   (a) Tonal: column mean vs rolling 15-col median (catches brightness seams)
+    #   (b) Gradient: per-column horizontal-gradient magnitude vs local median
+    #       (catches spatial seams where mean is fine but content is misaligned)
+    from scipy.ndimage import median_filter as _medf
+
+    # Tonal pass
+    col_local_median = _medf(col_means2, size=15, mode="nearest")
+    col_deviation = np.abs(col_means2 - col_local_median) / np.maximum(col_local_median, 1.0)
+    tonal_mask = col_deviation > 0.015
+
+    # Gradient pass — |col_c - col_{c-1}| averaged down each column boundary.
+    # Unusually high gradient vs local median flags spatial misalignment seams.
+    # Use the detected exposure row range so we cover the actual content area
+    # (teeth + bone), not just the upper skull band. The right-side seams live
+    # in the teeth zone, so the ROI must reach into mid/lower rows.
+    _grad_row_lo = max(_exp_row_lo + 20, 0)
+    _grad_row_hi = min(_exp_row_hi - 20, height)
+    if _grad_row_hi - _grad_row_lo < 100:  # sanity fallback
+        _grad_row_lo, _grad_row_hi = 50, min(height, 1200)
+    _roi = _col_arr2[_grad_row_lo:_grad_row_hi, :].astype(np.float64)
+    col_grad = np.abs(np.diff(_roi, axis=1)).mean(axis=0)  # length width-1
+    col_grad = np.concatenate([[col_grad[0]], col_grad])   # pad to width
+    grad_local_median = _medf(col_grad, size=31, mode="nearest")
+    grad_ratio = col_grad / np.maximum(grad_local_median, 1.0)
+    gradient_mask = grad_ratio > 1.25  # column gradient 1.25× local baseline
+
+    seam_mask = tonal_mask | gradient_mask
+
+    # Periodic extrapolation — if the detected gradient seams show a consistent
+    # spacing, the seams are a hardware scanline-batch artifact and appear at
+    # every multiple of the period. Extend seam_mask to all predicted positions
+    # so we catch right-side seams that the detector misses when local gradient
+    # baseline is elevated (e.g. in detail-rich teeth regions).
+    grad_indices = np.where(gradient_mask)[0]
+    if len(grad_indices) >= 3:
+        spacings = np.diff(grad_indices)
+        # Keep only the dominant spacing (filter out doubled/adjacent hits)
+        valid_spacings = spacings[(spacings > 50) & (spacings < 500)]
+        if len(valid_spacings) >= 2:
+            period = int(np.median(valid_spacings))
+            # Sanity check: period should be stable (low variance)
+            if np.std(valid_spacings) < period * 0.15:
+                first = int(grad_indices[0])
+                last_detected = int(grad_indices[-1])
+                # Extrapolate forward from the last detected seam
+                c = last_detected + period
+                extrapolated = 0
+                while c < width:
+                    # Mark a ±1 col window to absorb period jitter
+                    for cc in (c - 1, c, c + 1):
+                        if 0 <= cc < width:
+                            seam_mask[cc] = True
+                    extrapolated += 1
+                    c += period
+                if extrapolated > 0:
+                    log.info("Column seam: extrapolated %d additional seams at period=%d",
+                             extrapolated, period)
+
+    # Correction: multiplicative toward local tonal median.
+    col_ratio_seam = col_local_median / np.maximum(col_means2, 1.0)
+    col_ratio_seam = np.clip(col_ratio_seam, 0.85, 1.15)
+    correction = np.ones_like(col_ratio_seam, dtype=np.float32)
+    correction[seam_mask] = col_ratio_seam[seam_mask].astype(np.float32)
+    normalized = np.clip(normalized * correction[np.newaxis, :], 0.0, 1.0)
+
+    # For pure-gradient seams, tonal correction won't help (mean was already right).
+    # Add a targeted horizontal smoothing step at those exact columns: replace the
+    # seam column with the average of its two neighbors. Preserves anatomy elsewhere.
+    grad_only = gradient_mask & ~tonal_mask
+    if grad_only.any():
+        grad_cols = np.where(grad_only)[0]
+        for c in grad_cols:
+            if 0 < c < width - 1:
+                normalized[:, c] = 0.5 * (normalized[:, c - 1] + normalized[:, c + 1])
+
+    num_seams = int(seam_mask.sum())
+    if num_seams > 0:
+        seam_indices = np.where(seam_mask)[0]
+        runs = []
+        start = seam_indices[0]
+        prev = start
+        for idx in seam_indices[1:]:
+            if idx - prev > 2:
+                runs.append((start, prev))
+                start = idx
+            prev = idx
+        runs.append((start, prev))
+        run_str = ", ".join(f"{a}-{b}" if a != b else f"{a}" for a, b in runs[:20])
+        log.info("Column seam repair: %d cols (tonal=%d, gradient=%d) in %d runs: %s%s",
+                 num_seams, int(tonal_mask.sum()), int(gradient_mask.sum()),
+                 len(runs), run_str,
+                 " (...truncated)" if len(runs) > 20 else "")
 
     if invert:
         normalized = 1.0 - normalized
@@ -2149,8 +2266,8 @@ def reconstruct_image(
         import cv2
         # Light pre-CLAHE smoothing reduces shot-noise amplification,
         # larger tiles + softer clip keep contrast without graininess.
-        img_16 = cv2.GaussianBlur(img_16, (0, 0), sigmaX=0.6)
-        clahe = cv2.createCLAHE(clipLimit=1.0, tileGridSize=(48, 48))
+        img_16 = cv2.GaussianBlur(img_16, (0, 0), sigmaX=1.2)
+        clahe = cv2.createCLAHE(clipLimit=1.0, tileGridSize=(16, 16))
         img_16 = clahe.apply(img_16)
     except ImportError:
         pass
@@ -2177,6 +2294,11 @@ def reconstruct_image(
         )
     except Exception:
         pass
+
+    # ── Orientation: flip 180° to match dental-panoramic convention ──
+    # Upper crowns face down, lower crowns face up, patient's right on
+    # viewer's left. L/R placement is preserved (180° rotation, not mirror).
+    img_pil = img_pil.transpose(Image.ROTATE_180)
 
     log.info("Reconstructed: %dx%d  percentile=[%.0f, %.0f]",
              width, height, low, high)
