@@ -240,17 +240,8 @@ if defined PYTHON_CMD (
 if not exist "%DATA_DIR%" mkdir "%DATA_DIR%"
 if not exist "%DATA_DIR%\patients" mkdir "%DATA_DIR%\patients"
 
-:: Create desktop shortcut (points to this bat = auto-update trick)
-set "SHORTCUT_PATH=%USERPROFILE%\Desktop\%SHORTCUT_NAME%.lnk"
-if not exist "!SHORTCUT_PATH!" (
-    echo [%APP_NAME%] Creating Desktop shortcut...
-    powershell -NoProfile -Command "$ws = New-Object -ComObject WScript.Shell; $sc = $ws.CreateShortcut('%USERPROFILE%\Desktop\%SHORTCUT_NAME%.lnk'); $sc.TargetPath = '%INSTALL_DIR%\SetupAndRun.bat'; $sc.WorkingDirectory = '%INSTALL_DIR%'; $sc.IconLocation = '%EXE_PATH%'; $sc.Description = 'PureXS - Panoramic X-Ray Pipeline'; $sc.Save()"
-    if exist "!SHORTCUT_PATH!" (
-        echo [%APP_NAME%] Desktop shortcut created.
-    ) else (
-        echo [%APP_NAME%] Warning: Could not create shortcut.
-    )
-)
+:: Shortcut creation moved to :launch so it self-heals on every run
+:: (e.g. if user deletes shortcut, or first attempt failed silently)
 
 :: Write marker file — post-install complete
 echo installed> "%MARKER%"
@@ -316,6 +307,29 @@ if not exist "%EXE_PATH%" (
     echo [%APP_NAME%] The installation may be corrupt. Delete the install directory and re-run.
     pause
     exit /b 1
+)
+
+:: ------------------------------------------------------------
+:: Ensure Desktop shortcut exists (self-heals every launch)
+:: Resolves the real Desktop via [Environment]::GetFolderPath('Desktop')
+:: so OneDrive-redirected desktops on Win10/11/11 Pro work correctly.
+:: ------------------------------------------------------------
+set "DESKTOP_DIR="
+for /f "usebackq delims=" %%D in (`powershell -NoProfile -Command "[Environment]::GetFolderPath('Desktop')"`) do set "DESKTOP_DIR=%%D"
+if not defined DESKTOP_DIR set "DESKTOP_DIR=%USERPROFILE%\Desktop"
+set "SHORTCUT_PATH=!DESKTOP_DIR!\%SHORTCUT_NAME%.lnk"
+echo [%date% %time%] Desktop resolved to: !DESKTOP_DIR! >> "%LOGFILE%"
+
+if not exist "!SHORTCUT_PATH!" (
+    echo [%APP_NAME%] Creating Desktop shortcut at !DESKTOP_DIR!...
+    powershell -NoProfile -Command "$ws = New-Object -ComObject WScript.Shell; $sc = $ws.CreateShortcut('!SHORTCUT_PATH!'); $sc.TargetPath = '%INSTALL_DIR%\SetupAndRun.bat'; $sc.WorkingDirectory = '%INSTALL_DIR%'; $sc.IconLocation = '%EXE_PATH%'; $sc.Description = 'PureXS - Panoramic X-Ray Pipeline'; $sc.Save()"
+    if exist "!SHORTCUT_PATH!" (
+        echo [%APP_NAME%] Desktop shortcut created: !SHORTCUT_PATH!
+        echo [%date% %time%] Shortcut created: !SHORTCUT_PATH! >> "%LOGFILE%"
+    ) else (
+        echo [%APP_NAME%] WARNING: Could not create shortcut at !SHORTCUT_PATH!
+        echo [%date% %time%] Shortcut creation FAILED at !SHORTCUT_PATH! >> "%LOGFILE%"
+    )
 )
 
 :: Tell the WPF app where Python is (for the decoder subprocess)

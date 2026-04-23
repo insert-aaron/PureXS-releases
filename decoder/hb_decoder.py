@@ -2249,6 +2249,43 @@ def reconstruct_image(
                         log.info("Column seam: extrapolated %d cols at period=%d (anchor=%d)",
                                  extrapolated, period, anchor)
 
+    # ── Seam-correction diagnostic dumps ───────────────────────────────
+    # Save the right 30% of the image at each checkpoint to isolate where
+    # the residual right-side streaks are introduced/persisted. Toggleable
+    # with PUREXS_SEAM_DEBUG=1; writes to /tmp/seam_debug_*.png. 8-bit
+    # percentile-stretched for visibility.
+    import os as _os
+    _seam_debug = _os.environ.get("PUREXS_SEAM_DEBUG") == "1"
+
+    def _dump_stretched(arr: np.ndarray, path: str, label: str) -> None:
+        lo, hi = np.percentile(arr, (1.0, 99.0))
+        if hi <= lo:
+            hi = lo + 1e-6
+        stretched = np.clip((arr - lo) / (hi - lo), 0.0, 1.0)
+        out8 = (stretched * 255).astype(np.uint8)
+        Image.fromarray(out8, mode="L").save(path)
+        log.info("Seam debug: wrote %s (%s shape=%s)", path, label, out8.shape)
+
+    def _dump_stage(tag: str, arr: np.ndarray) -> None:
+        if not _seam_debug:
+            return
+        try:
+            # Rotate first so crops are in final dental-panoramic orientation.
+            # "Right side of the final image" = LEFT side of the raw array,
+            # because reconstruct_image() rotates 180° at the end. Any crop
+            # done BEFORE rotation samples the wrong half of the image.
+            oriented = np.rot90(arr, 2)
+            h, w = oriented.shape
+            right_start = int(w * 0.70)  # right 30% of the final-oriented image
+            _dump_stretched(oriented, f"/tmp/seam_debug_{tag}_full.png", "full")
+            _dump_stretched(oriented[:, right_start:],
+                            f"/tmp/seam_debug_{tag}_right.png",
+                            f"right cols={right_start}..{w - 1}")
+        except Exception as exc:
+            log.warning("Seam debug dump failed for %s: %s", tag, exc)
+
+    _dump_stage("01_pre_rowshift", normalized)
+
     # ── Row-shift correction — align each scanline batch vertically ──
     # The hardware produces ~249-col scanline batches; adjacent batches are
     # vertically offset by ±1-6 rows. The offset isn't uniform across the
@@ -2474,6 +2511,8 @@ def reconstruct_image(
                 _fmt(_shifts_top.tolist()),
             )
 
+    _dump_stage("02_post_rowshift", normalized)
+
     # Tonal correction — multiplicative ratio toward local median. Helpful for
     # residual brightness-shift seams; harmless on spatial seams (ratio ~1).
     col_ratio_seam = col_local_median / np.maximum(col_means2, 1.0)
@@ -2481,6 +2520,8 @@ def reconstruct_image(
     correction = np.ones_like(col_ratio_seam, dtype=np.float32)
     correction[seam_mask] = col_ratio_seam[seam_mask].astype(np.float32)
     normalized = np.clip(normalized * correction[np.newaxis, :], 0.0, 1.0)
+
+    _dump_stage("03_post_tonal", normalized)
 
     # Spatial smoothing — even after row-shift alignment, single-col seam artifacts
     # (e.g. at the exact boundary pixel) remain. Replace each seam col with a
@@ -2498,6 +2539,61 @@ def reconstruct_image(
                 continue
             t = (c - left) / max(right - left, 1)
             normalized[:, c] = normalized[:, left] * (1 - t) + normalized[:, right] * t
+
+    _dump_stage("04_post_blend", normalized)
+
+    # ── Seam-boundary gain stitching ──────────────────────────────────
+    # Adjacent scanline batches carry a sub-1% mean-brightness residual
+    # that survives the per-col seam correction. Invisible pre-CLAHE but
+    # amplified by CLAHE's per-tile histograms into visible tile-column
+    # streaks. Measure the ratio between the 10-col strips either side
+    # of each seam (same strips the row-shift correlation uses — they
+    # cross similar anatomy, so the ratio is the hardware residual, not
+    # anatomical variation). Propagate gains so adjacent edges match,
+    # anchor the median gain at 1.0 to preserve global brightness.
+    if len(_grouped_seams) >= 2:
+        _bs_full = [0] + [s + 1 for s in _grouped_seams]
+        _be_full = list(_grouped_seams) + [width]
+        BOUNDARY_W = 10   # cols on each side of seam for mean-ratio measurement
+        BOUNDARY_GAP = 3  # skip distorted cols at the seam itself
+        RATIO_CAP = 0.03  # per-seam cap (±3%) — anatomy-driven differences at
+                          # a 20-col span rarely exceed this
+        _ratios: list[float] = []
+        for sp in _grouped_seams:
+            ll = max(sp - BOUNDARY_W - BOUNDARY_GAP, 0)
+            lh = max(sp - BOUNDARY_GAP, 0)
+            rl = min(sp + BOUNDARY_GAP, width)
+            rh = min(sp + BOUNDARY_W + BOUNDARY_GAP, width)
+            if lh - ll < 3 or rh - rl < 3:
+                _ratios.append(1.0)
+                continue
+            left_mean = float(normalized[_grad_row_lo:_grad_row_hi, ll:lh].mean())
+            right_mean = float(normalized[_grad_row_lo:_grad_row_hi, rl:rh].mean())
+            if left_mean < 1e-3 or right_mean < 1e-3:
+                _ratios.append(1.0)
+                continue
+            ratio = left_mean / right_mean  # gain to apply to right batch
+                                             # so its edge matches left's edge
+            ratio = max(1.0 - RATIO_CAP, min(1.0 + RATIO_CAP, ratio))
+            _ratios.append(ratio)
+        # Cumulative gains: batch 0 = 1.0, each subsequent batch multiplies
+        # by the boundary ratio on its left side.
+        _batch_gains = np.ones(len(_bs_full), dtype=np.float64)
+        for i, r in enumerate(_ratios):
+            _batch_gains[i + 1] = _batch_gains[i] * r
+        # Anchor at median so we don't drift global brightness.
+        _anchor_gain = float(np.median(_batch_gains))
+        if _anchor_gain > 1e-6:
+            _batch_gains = _batch_gains / _anchor_gain
+        for (s, e), g in zip(zip(_bs_full, _be_full), _batch_gains):
+            if e <= s or abs(g - 1.0) < 1e-3:
+                continue
+            normalized[:, s:e] = np.clip(normalized[:, s:e] * float(g), 0.0, 1.0)
+        log.info("Seam-gain stitching: ratios=[%s] cum_gains=[%s]",
+                 ", ".join(f"{r:.4f}" for r in _ratios),
+                 ", ".join(f"{g:.4f}" for g in _batch_gains.tolist()))
+
+    _dump_stage("04b_post_batch_gain", normalized)
 
     num_seams = int(seam_mask.sum())
     if num_seams > 0:
@@ -2532,6 +2628,44 @@ def reconstruct_image(
     except ImportError:
         pass
     img_8 = (img_16 >> 8).astype(np.uint8)
+
+    _dump_stage("05_post_clahe", img_8.astype(np.float32) / 255.0)
+
+    # ── Post-CLAHE seam repair ────────────────────────────────────────
+    # CLAHE's per-tile normalization amplifies sub-1% column-brightness
+    # residuals (invisible pre-CLAHE) into visible vertical streaks at
+    # every scanline batch boundary. The artifact varies row-to-row
+    # (tile-by-tile), so a per-column constant correction can't fix it.
+    # Apply a row-wise horizontal Gaussian blur ONLY in a narrow band
+    # around each seam col, which smooths each row independently and
+    # preserves detail away from seams.
+    if seam_mask.any():
+        from scipy.ndimage import gaussian_filter1d as _gauss1d
+        _f = img_8.astype(np.float32)
+        # Mask = cols within ±SEAM_BLUR_HALF of any seam col. This is
+        # where CLAHE's tile-boundary artifacts live; outside this band
+        # the original CLAHE output is preserved.
+        SEAM_BLUR_HALF = 4
+        _blur_mask = np.zeros(width, dtype=bool)
+        for c in np.where(seam_mask)[0]:
+            lo = max(c - SEAM_BLUR_HALF, 0)
+            hi = min(c + SEAM_BLUR_HALF + 1, width)
+            _blur_mask[lo:hi] = True
+        # Horizontal Gaussian blur along col axis — each row smoothed
+        # independently so row-varying CLAHE tile residuals get averaged
+        # with immediate neighbors. sigma=2.5 cols gives ~5-col effective
+        # window, enough to bridge the seam without smearing anatomy.
+        _blurred = _gauss1d(_f, sigma=2.5, axis=1, mode="nearest")
+        _out = np.where(_blur_mask[None, :], _blurred, _f)
+        _diff = np.abs(_out - _f)
+        log.info("Post-CLAHE seam smoothing: %d cols in blur band "
+                 "(seam_cols=%d), max pixel diff=%.2f, mean diff in band=%.3f",
+                 int(_blur_mask.sum()), int(seam_mask.sum()),
+                 float(_diff.max()),
+                 float(_diff[:, _blur_mask].mean()) if _blur_mask.any() else 0.0)
+        img_8 = np.clip(_out, 0.0, 255.0).astype(np.uint8)
+
+    _dump_stage("06_post_clahe_repair", img_8.astype(np.float32) / 255.0)
 
     # ── Zoom crop — use detected exposure bounds + fade margin ───────
     # Inset from the detected exposure region to guarantee we crop past
