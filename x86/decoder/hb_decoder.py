@@ -2251,10 +2251,13 @@ def reconstruct_image(
 
     # ── Row-shift correction — align each scanline batch vertically ──
     # The hardware produces ~249-col scanline batches; adjacent batches are
-    # vertically offset by ±1-6 rows (spatial jitter, not a tonal issue).
-    # Cross-correlate a strip on each side of every seam to measure the shift,
-    # then roll each batch to align all of them to the median coordinate frame.
-    # Group consecutive seam cols into single boundary indices.
+    # vertically offset by ±1-6 rows. The offset isn't uniform across the
+    # batch — it varies with row position (e.g. +1 at top, +3 at bot). A
+    # single dy per batch aligns the mid-rows but leaves residual streaks
+    # at top/bottom. We measure the shift at three row-positions (top/mid/
+    # bot third of the exposure rows), build 3 cumulative shift sequences
+    # anchored independently, and apply a per-row-interpolated shift to
+    # each batch via map_coordinates.
     _seam_positions = sorted(int(x) for x in np.where(seam_mask)[0])
     _grouped_seams: list[int] = []
     if _seam_positions:
@@ -2272,20 +2275,43 @@ def reconstruct_image(
         STRIP_W = 10   # cols on each side of seam used for correlation
         STRIP_GAP = 3  # skip cols immediately adjacent to seam (distorted)
 
-        MIN_CORR = 0.45   # below this, trust no shift (avoids noise-driven bogus dys)
-        DAMPEN = 1.0      # apply full measured shift — dampening leaves residual seams
+        DAMPEN = 1.0       # apply full measured shift — dampening leaves residual seams
+        MIN_CORR = 0.45    # v13 top-ROI threshold — proven to reject noise-driven bogus dys
+        MIN_CORR_DELTA = 0.60   # stricter for mid/bot (narrow ROIs are noisier)
+        MAX_DELTA = 2.0    # cap per-seam divergence between top and mid/bot — larger
+                           # values are correlation-edge artifacts from teeth periodicity
+        MAX_CUM_DELTA = 3.0  # cap accumulated top-vs-mid/bot divergence
 
-        def _measure_shift(sp: int) -> tuple[float, float]:
-            """Return (sub-pixel dy, peak correlation) for the given seam column."""
+        # Split the exposure rows into top/mid/bot thirds. If the region is
+        # too short to split (each third would be < ~120 rows, below which
+        # MAX_SHIFT=6 leaves too few correlated samples), fall back to a
+        # single full-range ROI — equivalent to pre-interp behavior.
+        _roi_h = _grad_row_hi - _grad_row_lo
+        if _roi_h >= 360:
+            _third = _roi_h // 3
+            _roi_ranges = [
+                (_grad_row_lo, _grad_row_lo + _third),
+                (_grad_row_lo + _third, _grad_row_lo + 2 * _third),
+                (_grad_row_lo + 2 * _third, _grad_row_hi),
+            ]
+        else:
+            _roi_ranges = [(_grad_row_lo, _grad_row_hi)]
+        _roi_centers = [0.5 * (lo + hi) for lo, hi in _roi_ranges]
+        _n_roi = len(_roi_ranges)
+
+        def _measure_range(sp: int, row_lo: int, row_hi: int) -> tuple[float, float]:
+            """Return (sub-pixel dy, peak correlation) for seam sp over rows [row_lo, row_hi)."""
             left_lo = max(sp - STRIP_W - STRIP_GAP, 0)
             left_hi = max(sp - STRIP_GAP, 0)
             right_lo = min(sp + STRIP_GAP, width)
             right_hi = min(sp + STRIP_W + STRIP_GAP, width)
             if left_hi - left_lo < 3 or right_hi - right_lo < 3:
                 return 0.0, 0.0
-            left_sig = normalized[_grad_row_lo:_grad_row_hi, left_lo:left_hi].mean(axis=1)
-            right_sig = normalized[_grad_row_lo:_grad_row_hi, right_lo:right_hi].mean(axis=1)
+            left_sig = normalized[row_lo:row_hi, left_lo:left_hi].mean(axis=1)
+            right_sig = normalized[row_lo:row_hi, right_lo:right_hi].mean(axis=1)
             L = len(left_sig)
+            if L < 80:
+                return 0.0, 0.0
             corrs: dict[int, float] = {}
             for dy in range(-MAX_SHIFT, MAX_SHIFT + 1):
                 if dy == 0:
@@ -2294,7 +2320,7 @@ def reconstruct_image(
                     a, b = left_sig[dy:], right_sig[:L - dy]
                 else:
                     a, b = left_sig[:L + dy], right_sig[-dy:]
-                if len(a) < 100:
+                if len(a) < 60:
                     continue
                 a_c = a - a.mean()
                 b_c = b - b.mean()
@@ -2306,7 +2332,6 @@ def reconstruct_image(
                 return 0.0, 0.0
             best_dy = max(corrs, key=corrs.get)
             best_corr = corrs[best_dy]
-            # Parabolic interpolation around the integer peak for sub-pixel accuracy
             if best_dy - 1 in corrs and best_dy + 1 in corrs:
                 y0 = corrs[best_dy - 1]
                 y1 = corrs[best_dy]
@@ -2314,45 +2339,140 @@ def reconstruct_image(
                 denom_p = (y0 - 2 * y1 + y2)
                 if abs(denom_p) > 1e-9:
                     offset = 0.5 * (y0 - y2) / denom_p
-                    offset = max(-0.5, min(0.5, offset))  # clamp to [-0.5, +0.5]
+                    offset = max(-0.5, min(0.5, offset))
                     return float(best_dy) + offset, best_corr
             return float(best_dy), best_corr
 
-        from scipy.ndimage import shift as _ndshift
+        from scipy.ndimage import map_coordinates as _map_coords
         _batch_starts = [0] + [s + 1 for s in _grouped_seams]
         _batch_ends = list(_grouped_seams) + [width]
 
-        def _apply_pass(pass_label: str) -> tuple[list[float], list[float], np.ndarray]:
-            """Measure shifts at every seam, compute cumulative per-batch offsets
-            (anchored at median), and roll each batch vertically. Returns the
-            measured dys, confidences, and applied shifts for logging."""
-            measurements = [_measure_shift(sp) for sp in _grouped_seams]
-            dys = [(d if c >= MIN_CORR else 0.0) * DAMPEN for d, c in measurements]
-            confs = [c for _, c in measurements]
+        # Primary shift = top ROI (v13 behavior, proven). Mid/bot supply a
+        # bounded row-dependent *perturbation* on top of that — the per-row
+        # hypothesis is a small correction, not a fresh independent estimate,
+        # so deltas are heavily gated and the cumulative delta is capped so
+        # noisy measurements can't compound into visible distortion.
+        _n_seams = len(_grouped_seams)
+        _raw_top: list[float] = []
+        _conf_top: list[float] = []
+        _raw_mid: list[float] = []
+        _conf_mid: list[float] = []
+        _raw_bot: list[float] = []
+        _conf_bot: list[float] = []
+        for sp in _grouped_seams:
+            if _n_roi == 3:
+                top_lo, top_hi = _roi_ranges[0]
+                mid_lo, mid_hi = _roi_ranges[1]
+                bot_lo, bot_hi = _roi_ranges[2]
+                dt, ct = _measure_range(sp, top_lo, top_hi)
+                dm, cm = _measure_range(sp, mid_lo, mid_hi)
+                db, cb = _measure_range(sp, bot_lo, bot_hi)
+            else:
+                dt, ct = _measure_range(sp, _grad_row_lo, _grad_row_hi)
+                dm, cm = dt, ct
+                db, cb = dt, ct
+            _raw_top.append(dt); _conf_top.append(ct)
+            _raw_mid.append(dm); _conf_mid.append(cm)
+            _raw_bot.append(db); _conf_bot.append(cb)
 
-            cumulative = np.zeros(len(_grouped_seams) + 1, dtype=np.float64)
-            for i, dy in enumerate(dys):
-                cumulative[i + 1] = cumulative[i] + float(dy)
-            anchor = float(np.median(cumulative))
-            shifts = cumulative - anchor
+        # Top dys — identical to v13: gate by MIN_CORR, apply DAMPEN.
+        _dys_top = [(d if c >= MIN_CORR else 0.0) * DAMPEN
+                    for d, c in zip(_raw_top, _conf_top)]
 
-            for bi, (start, end) in enumerate(zip(_batch_starts, _batch_ends)):
-                sh = float(shifts[bi])
-                if abs(sh) < 0.05 or end <= start:
-                    continue
-                batch = normalized[:, start:end]
-                normalized[:, start:end] = _ndshift(
-                    batch, shift=(sh, 0), order=3, mode="nearest", prefilter=True
-                ).astype(np.float32)
-            return dys, confs, shifts
+        # Mid/bot deltas = raw - raw_top, but only when BOTH are confident
+        # AND the delta is small enough to be a plausible row-position drift
+        # (not a correlation-edge artifact, which would blow |delta| up to ~12).
+        def _gate_delta(d_raw: float, c_raw: float,
+                        d_top_raw: float, c_top_raw: float) -> float:
+            if c_raw < MIN_CORR_DELTA or c_top_raw < MIN_CORR:
+                return 0.0
+            delta = d_raw - d_top_raw
+            if abs(delta) > MAX_DELTA:
+                return 0.0
+            return delta
 
-        _dys, _confs, _shifts = _apply_pass("main")
-        log.info(
-            "Row-shift correction: dys=%s confs=%s shifts=%s",
-            [f"{d:+.2f}" for d in _dys],
-            [f"{c:.2f}" for c in _confs],
-            [f"{s:+.2f}" for s in _shifts.tolist()],
-        )
+        _delta_mid = [_gate_delta(_raw_mid[i], _conf_mid[i], _raw_top[i], _conf_top[i])
+                      for i in range(_n_seams)]
+        _delta_bot = [_gate_delta(_raw_bot[i], _conf_bot[i], _raw_top[i], _conf_top[i])
+                      for i in range(_n_seams)]
+
+        # Cumulate top normally; cumulate deltas with per-step cap so any
+        # coherent noise in deltas can't drift past MAX_CUM_DELTA.
+        _cum_top = np.zeros(_n_seams + 1, dtype=np.float64)
+        for i, d in enumerate(_dys_top):
+            _cum_top[i + 1] = _cum_top[i] + float(d)
+
+        def _cum_capped(deltas: list[float]) -> np.ndarray:
+            out = np.zeros(len(deltas) + 1, dtype=np.float64)
+            for i, d in enumerate(deltas):
+                raw = out[i] + float(d)
+                out[i + 1] = max(-MAX_CUM_DELTA, min(MAX_CUM_DELTA, raw))
+            return out
+
+        _cum_delta_mid = _cum_capped(_delta_mid)
+        _cum_delta_bot = _cum_capped(_delta_bot)
+        _cum_mid = _cum_top + _cum_delta_mid
+        _cum_bot = _cum_top + _cum_delta_bot
+
+        # Anchor each ROI at its own median so the correction is row-centered
+        # — a constant top/bot offset gets absorbed by the anchors and doesn't
+        # show up as distortion, only genuine row-varying drift does.
+        _shifts_top = _cum_top - float(np.median(_cum_top))
+        _shifts_mid = _cum_mid - float(np.median(_cum_mid))
+        _shifts_bot = _cum_bot - float(np.median(_cum_bot))
+
+        # Apply per-row shift per batch via map_coordinates. np.interp builds
+        # a shift-per-row curve from the per-ROI shifts at their center-rows;
+        # rows outside the ROI-center span clamp to the nearest endpoint.
+        _row_idx = np.arange(height, dtype=np.float64)
+        _roi_center_arr = np.asarray(_roi_centers, dtype=np.float64)
+        _per_roi_shifts = [_shifts_top, _shifts_mid, _shifts_bot] if _n_roi == 3 else [_shifts_top]
+        for bi, (start, end) in enumerate(zip(_batch_starts, _batch_ends)):
+            if end <= start:
+                continue
+            batch_shifts = np.array(
+                [_per_roi_shifts[ri][bi] for ri in range(_n_roi)],
+                dtype=np.float64,
+            )
+            if float(np.max(np.abs(batch_shifts))) < 0.05:
+                continue
+            per_row_shift = np.interp(_row_idx, _roi_center_arr, batch_shifts)
+            bw = end - start
+            batch = normalized[:, start:end].astype(np.float64, copy=False)
+            shifted_y = _row_idx - per_row_shift
+            row_coords = np.ascontiguousarray(
+                np.broadcast_to(shifted_y[:, None], (height, bw))
+            )
+            col_coords = np.ascontiguousarray(
+                np.broadcast_to(np.arange(bw, dtype=np.float64)[None, :], (height, bw))
+            )
+            normalized[:, start:end] = _map_coords(
+                batch,
+                [row_coords, col_coords],
+                order=3,
+                mode="nearest",
+                prefilter=True,
+            ).astype(np.float32)
+
+        _fmt = lambda xs: "[" + ", ".join(f"{x:+.2f}" for x in xs) + "]"
+        if _n_roi == 3:
+            log.info(
+                "Row-shift correction: dys_top=%s confs_top=%s "
+                "delta_mid=%s delta_bot=%s shifts_top=%s shifts_bot=%s",
+                _fmt(_dys_top),
+                _fmt(_conf_top),
+                _fmt(_delta_mid),
+                _fmt(_delta_bot),
+                _fmt(_shifts_top.tolist()),
+                _fmt(_shifts_bot.tolist()),
+            )
+        else:
+            log.info(
+                "Row-shift correction (single-ROI fallback): dys=%s confs=%s shifts=%s",
+                _fmt(_dys_top),
+                _fmt(_conf_top),
+                _fmt(_shifts_top.tolist()),
+            )
 
     # Tonal correction — multiplicative ratio toward local median. Helpful for
     # residual brightness-shift seams; harmless on spatial seams (ratio ~1).
