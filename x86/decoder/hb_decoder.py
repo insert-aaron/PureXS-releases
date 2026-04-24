@@ -1978,7 +1978,15 @@ def reconstruct_image(
     # have near-zero signal after dark correction. If not masked, the
     # final invert flips them to pure white, producing blown-out edges.
     # Walk in from each edge until we hit a column/row with real signal.
-    _col_means = np.mean(img_f, axis=0)
+    # Restrict col-mean to the content band (middle 70% of rows) — the
+    # saturation strips at detector top/bottom drag the mean of pre-
+    # exposure cols above the low-signal threshold (measured 72 vs
+    # threshold 71 on the reference scan), so those cols weren't walked
+    # past. After the final 180° rotate that pre-exposure strip shows up
+    # as a bright fade on the right side of the panoramic.
+    _content_lo = height // 7
+    _content_hi = height * 6 // 7
+    _col_means = np.mean(img_f[_content_lo:_content_hi, :], axis=0)
     _col_peak = float(np.max(_col_means)) if _col_means.size else 1.0
     _col_thresh = max(_col_peak * 0.08, 1.0)
     _exp_col_lo = 0
@@ -2457,6 +2465,32 @@ def reconstruct_image(
         _shifts_top = _cum_top - float(np.median(_cum_top))
         _shifts_mid = _cum_mid - float(np.median(_cum_mid))
         _shifts_bot = _cum_bot - float(np.median(_cum_bot))
+
+        # ── Manual per-batch tweaks (visually-tuned residuals) ─────────
+        # Batches identified by the raw-col they contain (not by index,
+        # which varies if seam detection picks up different counts between
+        # scans). Value is desired additional DOWNWARD shift in the FINAL
+        # rotated image, in pixels. We subtract it from the raw shift
+        # because raw-up == final-down after the 180° rotation.
+        _MANUAL_TWEAKS_FINAL_DOWN_PX = [
+            (420, 10.0),  # R10 batch (raw cols ~349-491) — user-tuned +10 px down
+            (615, 10.0),  # R9 batch  (raw cols ~492-740) — user-tuned +10 px down
+            (865, 4.0),   # R8 batch  (raw cols ~740-989) — user-tuned +4 px down
+        ]
+        for _anchor_raw_col, _final_dy in _MANUAL_TWEAKS_FINAL_DOWN_PX:
+            _bi = next(
+                (i for i, (s, e) in enumerate(zip(_batch_starts, _batch_ends))
+                 if s <= _anchor_raw_col < e),
+                None,
+            )
+            if _bi is not None and 0 <= _bi < len(_shifts_top):
+                _shifts_top[_bi] -= _final_dy
+                _shifts_mid[_bi] -= _final_dy
+                _shifts_bot[_bi] -= _final_dy
+                log.info("Manual tweak: batch %d (cols %d-%d, anchor=%d) "
+                         "shifted %+g px down in final (raw shift delta %+g)",
+                         _bi, _batch_starts[_bi], _batch_ends[_bi],
+                         _anchor_raw_col, _final_dy, -_final_dy)
 
         # Apply per-row shift per batch via map_coordinates. np.interp builds
         # a shift-per-row curve from the per-ROI shifts at their center-rows;
