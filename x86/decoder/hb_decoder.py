@@ -1978,15 +1978,7 @@ def reconstruct_image(
     # have near-zero signal after dark correction. If not masked, the
     # final invert flips them to pure white, producing blown-out edges.
     # Walk in from each edge until we hit a column/row with real signal.
-    # Restrict col-mean to the content band (middle 70% of rows) — the
-    # saturation strips at detector top/bottom drag the mean of pre-
-    # exposure cols above the low-signal threshold (measured 72 vs
-    # threshold 71 on the reference scan), so those cols weren't walked
-    # past. After the final 180° rotate that pre-exposure strip shows up
-    # as a bright fade on the right side of the panoramic.
-    _content_lo = height // 7
-    _content_hi = height * 6 // 7
-    _col_means = np.mean(img_f[_content_lo:_content_hi, :], axis=0)
+    _col_means = np.mean(img_f, axis=0)
     _col_peak = float(np.max(_col_means)) if _col_means.size else 1.0
     _col_thresh = max(_col_peak * 0.08, 1.0)
     _exp_col_lo = 0
@@ -2316,19 +2308,12 @@ def reconstruct_image(
         _grouped_seams.append(int(np.mean(_run)))
 
     if len(_grouped_seams) >= 2:
-        # MAX_SHIFT widened from 6 → 12 to catch true per-seam shifts that
-        # would otherwise clamp to ±6 and systematically under-report the
-        # cumulative drift at the start/end of the sweep. |dy|>6 requires a
-        # stricter correlation to reject false peaks (see MIN_CORR_LARGE).
-        MAX_SHIFT = 12
+        MAX_SHIFT = 6
         STRIP_W = 10   # cols on each side of seam used for correlation
         STRIP_GAP = 3  # skip cols immediately adjacent to seam (distorted)
 
         DAMPEN = 1.0       # apply full measured shift — dampening leaves residual seams
         MIN_CORR = 0.45    # v13 top-ROI threshold — proven to reject noise-driven bogus dys
-        MIN_CORR_LARGE = 0.70  # stricter threshold for |dy|>6 — noise can fake a
-                               # large correlation peak when the seam is on a periodic
-                               # tooth pattern; require strong evidence before applying
         MIN_CORR_DELTA = 0.60   # stricter for mid/bot (narrow ROIs are noisier)
         MAX_DELTA = 2.0    # cap per-seam divergence between top and mid/bot — larger
                            # values are correlation-edge artifacts from teeth periodicity
@@ -2427,50 +2412,9 @@ def reconstruct_image(
             _raw_mid.append(dm); _conf_mid.append(cm)
             _raw_bot.append(db); _conf_bot.append(cb)
 
-        # Top dys — gate by MIN_CORR (or MIN_CORR_LARGE for |dy|>6), apply DAMPEN.
-        def _gate_top(d: float, c: float) -> float:
-            need = MIN_CORR_LARGE if abs(d) > 6.0 else MIN_CORR
-            return (d if c >= need else 0.0) * DAMPEN
-
-        _dys_top = [_gate_top(d, c) for d, c in zip(_raw_top, _conf_top)]
-
-        # Backfill low-confidence seams (including the first 1-2 seams which
-        # are unmeasurable because there's not enough anatomy at the start of
-        # the sweep for correlation). Use the nearest high-confidence seam's
-        # measured value as the prediction — the scanline-batch shift pattern
-        # is quasi-periodic, so adjacent seams are the best local estimate.
-        # Without this, unmeasurable seams contribute 0 and the cumulative
-        # shift at the ends of the sweep under-reports by the missing amount
-        # (which visible as misalignment in R9/R10 — the start-of-scan region).
-        _gated = [c < (MIN_CORR_LARGE if abs(d) > 6.0 else MIN_CORR)
-                  for d, c in zip(_raw_top, _conf_top)]
-        if any(_gated) and not all(_gated):
-            _confident_idx = [i for i, g in enumerate(_gated) if not g]
-            _backfilled = 0
-            for i in range(_n_seams):
-                if not _gated[i]:
-                    continue
-                # Find nearest confident seam(s) on each side; if both exist
-                # and are within 3 positions, average their dys; otherwise
-                # use the nearest one alone. Keep the fill modest — if no
-                # neighbor is within 4 positions, leave it at 0.
-                left = max((j for j in _confident_idx if j < i), default=None)
-                right = min((j for j in _confident_idx if j > i), default=None)
-                if left is not None and right is not None and right - left <= 4:
-                    pred = 0.5 * (_dys_top[left] + _dys_top[right])
-                elif left is not None and i - left <= 2:
-                    pred = _dys_top[left]
-                elif right is not None and right - i <= 2:
-                    pred = _dys_top[right]
-                else:
-                    continue
-                # Clamp the backfilled value to MAX_SHIFT so a noisy extreme
-                # neighbor can't propagate out of the physical range.
-                _dys_top[i] = float(np.clip(pred, -MAX_SHIFT, MAX_SHIFT))
-                _backfilled += 1
-            if _backfilled:
-                log.info("Row-shift backfill: %d low-confidence seams predicted from neighbors",
-                         _backfilled)
+        # Top dys — identical to v13: gate by MIN_CORR, apply DAMPEN.
+        _dys_top = [(d if c >= MIN_CORR else 0.0) * DAMPEN
+                    for d, c in zip(_raw_top, _conf_top)]
 
         # Mid/bot deltas = raw - raw_top, but only when BOTH are confident
         # AND the delta is small enough to be a plausible row-position drift
@@ -2684,18 +2628,6 @@ def reconstruct_image(
     except ImportError:
         pass
     img_8 = (img_16 >> 8).astype(np.uint8)
-
-    # ── Post-CLAHE contrast stretch (linear around midtone) ───────────
-    # Staff feedback requested slightly more contrast. Bumping CLAHE's
-    # clipLimit alone had negligible effect because the pre-CLAHE
-    # Gaussian blur (sigmaX=1.2, there to suppress shot noise) flattens
-    # the local variation CLAHE would amplify. A mild global stretch
-    # around midtone boosts overall contrast without amplifying noise
-    # in flat regions the way raising CLAHE clipLimit does.
-    _CONTRAST_GAIN = 1.12  # 12% more contrast around midtone
-    img_8 = np.clip(
-        (img_8.astype(np.int16) - 128) * _CONTRAST_GAIN + 128, 0, 255
-    ).astype(np.uint8)
 
     _dump_stage("05_post_clahe", img_8.astype(np.float32) / 255.0)
 
