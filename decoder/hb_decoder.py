@@ -2069,29 +2069,47 @@ def reconstruct_image(
 
         log.info("Die junction: row %d, interpolated dead rows %d-%d (%d rows)",
                  junction_row, gap_start, gap_end, gap_end - gap_start + 1)
-
-        # Check for gain step across the gap
-        STEP_W = 10
-        above_mean = np.mean(row_signal[max(0, gap_start - STEP_W):gap_start])
-        below_mean = np.mean(row_signal[gap_end + 1:min(height, gap_end + 1 + STEP_W)])
-        if above_mean > 10 and below_mean > 10:
-            step_ratio = above_mean / below_mean
-            step_pct = abs(step_ratio - 1.0) * 100
-            if step_pct > 3.0:
-                ratio = max(0.85, min(step_ratio, 1.20))
-                blend_half = 120
-                for r in range(height):
-                    dist = r - junction_row
-                    sigmoid = 1.0 / (1.0 + np.exp(-dist / (blend_half / 4)))
-                    img_f[r] *= 1.0 * (1 - sigmoid) + ratio * sigmoid
-                log.info("Die junction: gain correction %.3f (step=%.1f%%)",
-                         ratio, step_pct)
-            else:
-                log.info("Die junction: step=%.1f%% (no gain correction needed)",
-                         step_pct)
     else:
-        junction_row = mid
-        log.info("Die junction: no dead rows found, skipping correction")
+        # No dead rows — tightly butted dies still leave a gain step that
+        # CLAHE amplifies into a visible horizontal line (staff "white line
+        # in the middle" feedback). Locate the junction at the strongest
+        # signed step in row_signal inside the central band (smoothed first
+        # so noise spikes don't win the argmax) and fall through to the
+        # gain-step check below.
+        sm = _gf1d(row_signal[search_lo:search_hi].astype(np.float64), sigma=3.0)
+        if len(sm) >= 3:
+            junction_row = int(search_lo + np.argmax(np.abs(np.diff(sm))) + 1)
+        else:
+            junction_row = mid
+        gap_start = gap_end = junction_row
+        log.info("Die junction: row %d (no dead rows — gain-step only)",
+                 junction_row)
+
+    # ── Gain-step correction (runs in BOTH branches) ─────────────────
+    # Previously this was nested inside the dead-row branch, so detectors
+    # whose dies are tightly butted with no dead-row gap had their sub-3%
+    # gain mismatch left uncorrected. CLAHE then amplified the residual
+    # step into a visible horizontal line in the panoramic.
+    STEP_W = 10
+    above_mean = np.mean(row_signal[max(0, gap_start - STEP_W):gap_start])
+    below_mean = np.mean(row_signal[gap_end + 1:min(height, gap_end + 1 + STEP_W)])
+    if above_mean > 10 and below_mean > 10:
+        step_ratio = above_mean / below_mean
+        step_pct = abs(step_ratio - 1.0) * 100
+        # Threshold tightened 3.0 → 1.5: CLAHE makes even sub-3% steps
+        # visible on radiographs.
+        if step_pct > 1.5:
+            ratio = max(0.85, min(step_ratio, 1.20))
+            blend_half = 120
+            for r in range(height):
+                dist = r - junction_row
+                sigmoid = 1.0 / (1.0 + np.exp(-dist / (blend_half / 4)))
+                img_f[r] *= 1.0 * (1 - sigmoid) + ratio * sigmoid
+            log.info("Die junction: gain correction %.3f (step=%.1f%%)",
+                     ratio, step_pct)
+        else:
+            log.info("Die junction: step=%.1f%% (no gain correction needed)",
+                     step_pct)
 
     # ── Row repair ─────────────────────────────────────────────────────
     #   1. Telemetry-repair spike rows: the 36-pixel interpolated blocks
