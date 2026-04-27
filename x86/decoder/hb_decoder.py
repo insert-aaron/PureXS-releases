@@ -2070,29 +2070,33 @@ def reconstruct_image(
         log.info("Die junction: row %d, interpolated dead rows %d-%d (%d rows)",
                  junction_row, gap_start, gap_end, gap_end - gap_start + 1)
     else:
-        # No dead rows — tightly butted dies still leave a gain step that
-        # CLAHE amplifies into a visible horizontal line (staff "white line
-        # in the middle" feedback). Locate the junction at the strongest
-        # signed step in row_signal inside the central band (smoothed first
-        # so noise spikes don't win the argmax) and fall through to the
-        # gain-step check below.
-        sm = _gf1d(row_signal[search_lo:search_hi].astype(np.float64), sigma=3.0)
-        if len(sm) >= 3:
-            junction_row = int(search_lo + np.argmax(np.abs(np.diff(sm))) + 1)
-        else:
-            junction_row = mid
-        gap_start = gap_end = junction_row
-        log.info("Die junction: row %d (no dead rows — gain-step only)",
-                 junction_row)
+        # No dead rows — auto-detection of a "tightly butted" die boundary
+        # is not safe enough: argmax(|diff(row_signal)|) consistently picks
+        # anatomical gradients (hard palate, sinus floor, occlusal plane),
+        # and the resulting gain correction creates a visible dark band
+        # where no hardware artifact existed. We saw this exact regression
+        # on the Dental Republic Orthophos. Until per-detector calibration
+        # is wired in, leave the image alone in this branch.
+        junction_row = mid
+        gap_start = gap_end = -1  # sentinel: skip gain correction below
+        log.info("Die junction: no dead rows — skipping gain correction "
+                 "(auto-detect not reliable without calibration)")
 
-    # ── Gain-step correction (runs in BOTH branches) ─────────────────
+    # ── Gain-step correction (runs in BOTH branches when junction confident) ──
     # Previously this was nested inside the dead-row branch, so detectors
     # whose dies are tightly butted with no dead-row gap had their sub-3%
     # gain mismatch left uncorrected. CLAHE then amplified the residual
     # step into a visible horizontal line in the panoramic.
-    STEP_W = 10
-    above_mean = np.mean(row_signal[max(0, gap_start - STEP_W):gap_start])
-    below_mean = np.mean(row_signal[gap_end + 1:min(height, gap_end + 1 + STEP_W)])
+    # The no-dead-row branch sets gap_start = -1 when it can't find a
+    # confident hardware step; in that case we skip correction entirely
+    # rather than "fix" something that isn't a real die boundary.
+    if gap_start < 0:
+        STEP_W = 0  # disable; condition below will short-circuit on above_mean=0
+        above_mean = below_mean = 0.0
+    else:
+        STEP_W = 10
+        above_mean = np.mean(row_signal[max(0, gap_start - STEP_W):gap_start])
+        below_mean = np.mean(row_signal[gap_end + 1:min(height, gap_end + 1 + STEP_W)])
     if above_mean > 10 and below_mean > 10:
         step_ratio = above_mean / below_mean
         step_pct = abs(step_ratio - 1.0) * 100
@@ -2674,8 +2678,13 @@ def reconstruct_image(
         import cv2
         # Light pre-CLAHE smoothing reduces shot-noise amplification,
         # larger tiles + softer clip keep contrast without graininess.
-        img_16 = cv2.GaussianBlur(img_16, (0, 0), sigmaX=1.2)
-        clahe = cv2.createCLAHE(clipLimit=1.0, tileGridSize=(16, 16))
+        # Pre-CLAHE blur sigma reduced 1.2 → 0.6: the wider blur was the
+        # primary cause of the "not in HD" feedback — CLAHE can't sharpen
+        # detail that the prior step has already smoothed away.
+        img_16 = cv2.GaussianBlur(img_16, (0, 0), sigmaX=0.6)
+        # CLAHE clipLimit raised 1.0 → 1.8 (closer to Sidexis defaults) for
+        # stronger local contrast on bone trabeculae and root canals.
+        clahe = cv2.createCLAHE(clipLimit=1.8, tileGridSize=(16, 16))
         img_16 = clahe.apply(img_16)
     except ImportError:
         pass
@@ -2732,11 +2741,16 @@ def reconstruct_image(
         img_pil = img_pil.crop((crop_l, crop_t, crop_r, crop_b))
         img_pil = img_pil.resize((2440, 1280), Image.Resampling.LANCZOS)
 
-    # ── Mild unsharp mask ────────────────────────────────────────────
+    # ── Unsharp mask ────────────────────────────────────────────────
+    # radius 1 → 1.5 (slightly wider edge kernel), percent 60 → 110
+    # (stronger sharpening) — recovers acutance lost to the smaller
+    # pre-CLAHE blur and pushes the panoramic toward the crispness
+    # staff associate with HD output. threshold=3 still kept so flat
+    # bone areas don't get noisier.
     try:
         from PIL import ImageFilter
         img_pil = img_pil.filter(
-            ImageFilter.UnsharpMask(radius=1, percent=60, threshold=3)
+            ImageFilter.UnsharpMask(radius=1.5, percent=110, threshold=3)
         )
     except Exception:
         pass
