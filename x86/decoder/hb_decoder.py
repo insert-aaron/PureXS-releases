@@ -2676,19 +2676,96 @@ def reconstruct_image(
     img_16 = (normalized * 65535).astype(np.uint16)
     try:
         import cv2
-        # Light pre-CLAHE smoothing reduces shot-noise amplification,
-        # larger tiles + softer clip keep contrast without graininess.
-        # Pre-CLAHE blur sigma reduced 1.2 → 0.6: the wider blur was the
-        # primary cause of the "not in HD" feedback — CLAHE can't sharpen
-        # detail that the prior step has already smoothed away.
         img_16 = cv2.GaussianBlur(img_16, (0, 0), sigmaX=0.6)
-        # CLAHE clipLimit raised 1.0 → 1.8 (closer to Sidexis defaults) for
-        # stronger local contrast on bone trabeculae and root canals.
-        clahe = cv2.createCLAHE(clipLimit=1.8, tileGridSize=(16, 16))
+        # clipLimit lowered 1.8 → 1.2 to stop CLAHE from amplifying shot
+        # noise into visible grain. Crispness recovered post-bilateral
+        # via the unsharp mask below.
+        clahe = cv2.createCLAHE(clipLimit=1.2, tileGridSize=(16, 16))
         img_16 = clahe.apply(img_16)
     except ImportError:
         pass
     img_8 = (img_16 >> 8).astype(np.uint8)
+
+    # Edge-preserving denoise — kills the granular "snow" CLAHE leaves in
+    # flat bone/soft-tissue regions while keeping tooth/cortical edges
+    # sharp. d=7 wider kernel, sigmaColor=30 (~12% intensity tolerance),
+    # sigmaSpace=5. Stronger than the initial pass — staff reported the
+    # d=5/sigmaColor=18 version still left visible grain.
+    try:
+        import cv2 as _cv2_bf
+        img_8 = _cv2_bf.bilateralFilter(img_8, d=7, sigmaColor=30, sigmaSpace=5)
+    except ImportError:
+        pass
+
+    # ── Die-junction horizontal seam suppression (post-CLAHE) ─────────
+    # Two-die detector leaves a 1-3% gain step where dies meet; CLAHE
+    # amplifies it into a visible horizontal line. Detect by:
+    #   1. Per-column step sign — a hardware row step pushes EVERY column
+    #      in the same direction; anatomical gradients have mixed signs.
+    #   2. Locate the single strongest one-direction-consensus row in the
+    #      central 50% of the image.
+    #   3. Apply a sigmoid offset (not multiplicative — works on 8-bit
+    #      post-CLAHE values where signal isn't proportional to original).
+    if _exp_col_hi > _exp_col_lo + 100:
+        from scipy.ndimage import gaussian_filter1d as _gf1d_row
+        _band = img_8[:, _exp_col_lo:_exp_col_hi + 1].astype(np.float32)
+        # Per-row step at row r = mean(rows r..r+9) - mean(rows r-10..r-1)
+        # Computed per column. A real hardware step has consistent sign
+        # across columns; anatomy has mixed signs.
+        _STEP_W = 10
+        _search_lo = height // 4
+        _search_hi = height * 3 // 4
+        _best_row = -1
+        _best_signed_mean = 0.0
+        _best_consensus = 0.0
+        for _r in range(_search_lo, _search_hi):
+            if _r < _STEP_W or _r + _STEP_W >= height:
+                continue
+            _above_block = _band[_r - _STEP_W:_r, :].mean(axis=0)
+            _below_block = _band[_r + 1:_r + 1 + _STEP_W, :].mean(axis=0)
+            _per_col_step = _below_block - _above_block
+            # Consensus: fraction of columns with the same sign as the mean
+            _signed_mean = float(_per_col_step.mean())
+            if abs(_signed_mean) < 1.0:
+                continue
+            _consensus = float(np.mean(np.sign(_per_col_step) == np.sign(_signed_mean)))
+            if _consensus > _best_consensus and abs(_signed_mean) > abs(_best_signed_mean) * 0.7:
+                _best_consensus = _consensus
+                _best_signed_mean = _signed_mean
+                _best_row = _r
+        # Trigger when ≥80% of columns agree on direction AND the
+        # average step is at least 5 units. Anatomical row gradients
+        # rarely exceed 70% column consensus because curved features
+        # (jaw arch, sinus floor) push columns in different directions.
+        if _best_row > 0 and _best_consensus >= 0.80 and abs(_best_signed_mean) >= 5.0:
+            _offset = float(_best_signed_mean)
+            _offset = max(-25.0, min(25.0, _offset))
+            # Refine step location: the smooth-step detector finds the
+            # window center; zoom into a ±10 row window and find the
+            # actual sharpest 2-row transition. The seam in the final
+            # image lines up with this sharp center, not the smoothed one.
+            _band_means = _band.mean(axis=1)
+            _refine_lo = max(0, _best_row - 10)
+            _refine_hi = min(height - 1, _best_row + 10)
+            _sub_diffs = np.abs(np.diff(_band_means[_refine_lo:_refine_hi + 1]))
+            _refined_row = _refine_lo + int(np.argmax(_sub_diffs))
+            # Steeper sigmoid (blend_half=12) keeps the correction localized
+            # to the seam, avoiding a wide brightness shift that would be
+            # visible across the upper half of the image.
+            _blend_half = 12
+            _r_idx = np.arange(height, dtype=np.float64)
+            _sigmoid = 1.0 / (1.0 + np.exp(-(_r_idx - _refined_row) / (_blend_half / 4.0)))
+            _row_offset = (_offset * _sigmoid).astype(np.float32)
+            img_8 = np.clip(img_8.astype(np.float32) - _row_offset[:, None],
+                            0.0, 255.0).astype(np.uint8)
+            log.info("Die-junction seam: detect=%d refined=%d step=%+.1f units, "
+                     "consensus=%.0f%%",
+                     _best_row, _refined_row, _best_signed_mean,
+                     _best_consensus * 100)
+        else:
+            log.info("Die-junction seam: best row %d, mean step=%+.1f, "
+                     "consensus=%.0f%% — below trigger, skipping",
+                     _best_row, _best_signed_mean, _best_consensus * 100)
 
     _dump_stage("05_post_clahe", img_8.astype(np.float32) / 255.0)
 
@@ -2742,15 +2819,13 @@ def reconstruct_image(
         img_pil = img_pil.resize((2440, 1280), Image.Resampling.LANCZOS)
 
     # ── Unsharp mask ────────────────────────────────────────────────
-    # radius 1 → 1.5 (slightly wider edge kernel), percent 60 → 110
-    # (stronger sharpening) — recovers acutance lost to the smaller
-    # pre-CLAHE blur and pushes the panoramic toward the crispness
-    # staff associate with HD output. threshold=3 still kept so flat
-    # bone areas don't get noisier.
+    # percent 110 → 75, threshold 3 → 5: bilateral filter removed the
+    # high-freq grain that the previous aggressive sharpen was
+    # amplifying. Threshold=5 keeps flat bone from being re-roughened.
     try:
         from PIL import ImageFilter
         img_pil = img_pil.filter(
-            ImageFilter.UnsharpMask(radius=1.5, percent=110, threshold=3)
+            ImageFilter.UnsharpMask(radius=1.5, percent=75, threshold=5)
         )
     except Exception:
         pass
