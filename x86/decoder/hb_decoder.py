@@ -2697,20 +2697,18 @@ def reconstruct_image(
         pass
     img_8 = (img_16 >> 8).astype(np.uint8)
 
-    # Edge-preserving denoise — kills the granular "snow" CLAHE leaves in
-    # flat bone/soft-tissue regions while keeping tooth/cortical edges
-    # sharp. d=7 wider kernel, sigmaColor=30 (~12% intensity tolerance),
-    # sigmaSpace=5. Stronger than the initial pass — staff reported the
-    # d=5/sigmaColor=18 version still left visible grain.
+    # Edge-preserving denoise — bridges grain in flat bone/soft-tissue
+    # while leaving sharp anatomy alone. sigmaColor 40 → 25 (~10%
+    # intensity tolerance) restores root-tip and enamel sharpness that
+    # the previous setting was smearing into surrounding tissue;
+    # the AI A/B against Sidexis flagged this as the dominant softness
+    # contributor. Keep d=9 spatial reach so flat bone still smooths.
+    # 3×3 median blur removed — it was the second softness contributor
+    # (collapsing the trabecular-bone texture and apex detail) and noise
+    # is already clean enough without it on the current scans.
     try:
         import cv2 as _cv2_bf
-        # Wider kernel (d=9) + higher sigmaColor (40) + larger sigmaSpace (10)
-        # extend the smoothing reach inside flat bone/root regions while the
-        # color tolerance still respects tooth/cortical edges. Followed by a
-        # 3x3 median blur to kill isolated speckle specks without smearing
-        # legitimate fine structure.
-        img_8 = _cv2_bf.bilateralFilter(img_8, d=9, sigmaColor=40, sigmaSpace=10)
-        img_8 = _cv2_bf.medianBlur(img_8, 3)
+        img_8 = _cv2_bf.bilateralFilter(img_8, d=9, sigmaColor=25, sigmaSpace=10)
     except ImportError:
         pass
 
@@ -2756,21 +2754,26 @@ def reconstruct_image(
                 _best_consensus = _consensus
                 _best_signed_mean = _signed_mean
                 _best_row = _r
-        # Trigger when ≥80% of columns agree on direction AND the
-        # average step is at least 5 units. Anatomical row gradients
-        # rarely exceed 70% column consensus because curved features
-        # (jaw arch, sinus floor) push columns in different directions.
-        # Magnitude cap: a real die-junction step is 1-3% of mean signal,
-        # which on 8-bit post-CLAHE/bilateral data is ~3-8 grey levels. A
-        # step of >8 is anatomy (e.g. row 825 / step=-13.4 was the airway
-        # boundary masquerading as a die seam — visible bright band on
-        # the 2026-05-04 12:20 scan).
+        # Trigger thresholds:
+        #   consensus ≥ 0.70 — anatomical row gradients within the
+        #     central 40-48% band rarely break 70% column consensus
+        #     because curved features (jaw arch, sinus floor) push
+        #     columns in different directions
+        #   4 ≤ |step| ≤ 14 — die-junction step on 8-bit post-CLAHE
+        #     data ranges 4-14 grey levels depending on detector and
+        #     bilateral strength. Earlier airway false-positive at row
+        #     825 (step=-13.4) lived OUTSIDE the 40-48% search band
+        #     and is no longer a candidate, so we can trust larger
+        #     steps inside the band.
+        # Acosta 2026-05-04 (row 554, step=+12, consensus=75%) was
+        # rejected by the previous tighter thresholds — the white
+        # center line in that scan motivated this loosening.
         if (_best_row > 0
-                and _best_consensus >= 0.80
-                and abs(_best_signed_mean) >= 5.0
-                and abs(_best_signed_mean) <= 8.0):
+                and _best_consensus >= 0.70
+                and abs(_best_signed_mean) >= 4.0
+                and abs(_best_signed_mean) <= 14.0):
             _offset = float(_best_signed_mean)
-            _offset = max(-8.0, min(8.0, _offset))
+            _offset = max(-15.0, min(15.0, _offset))
             # Refine step location: the smooth-step detector finds the
             # window center; zoom into a ±10 row window and find the
             # actual sharpest 2-row transition. The seam in the final
