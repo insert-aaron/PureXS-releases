@@ -4,7 +4,14 @@ setlocal EnableDelayedExpansion
 :: ============================================================
 :: PureXS SetupAndRun.bat
 :: Auto-installer + updater + launcher
-:: WPF app (PureXS.exe) + Python decoder (decoder/)
+:: WPF app (PureXS.exe) + bundled Python decoder (python/, decoder/)
+::
+:: As of 2026-05, the embedded Python interpreter and decoder
+:: dependencies (numpy, opencv, scipy, Pillow, pydicom) are
+:: bundled into PureXS-releases by CI. No runtime download is
+:: required, so the decoder works on offline / firewalled /
+:: locked-down workstations where the previous self-install
+:: path was failing silently.
 ::
 :: Three-way state detection:
 ::   .git missing, marker missing  -> fresh clone + post-install + launch
@@ -30,27 +37,38 @@ if "%PROCESSOR_ARCHITECTURE%"=="AMD64" (
     set "ARCH=x64"
     set "EXE_PATH=%INSTALL_DIR%\%EXE_NAME%"
     set "DECODER_DIR=%INSTALL_DIR%\decoder"
+    set "BUNDLED_PY=%INSTALL_DIR%\python\python.exe"
 ) else if "%PROCESSOR_ARCHITEW6432%"=="AMD64" (
     set "ARCH=x64"
     set "EXE_PATH=%INSTALL_DIR%\%EXE_NAME%"
     set "DECODER_DIR=%INSTALL_DIR%\decoder"
+    set "BUNDLED_PY=%INSTALL_DIR%\python\python.exe"
 ) else (
     set "ARCH=x86"
     set "EXE_PATH=%INSTALL_DIR%\x86\%EXE_NAME%"
     set "DECODER_DIR=%INSTALL_DIR%\x86\decoder"
+    set "BUNDLED_PY=%INSTALL_DIR%\x86\python\python.exe"
 )
 
 title %APP_NAME% Setup and Launcher
 
-:: Log file for debugging shortcut launches
+:: ── Launcher log ─────────────────────────────────────────────
+:: Captures state transitions, the chosen Python interpreter, the
+:: result of every external command (git clone, winget, pip), and
+:: any error/warning text that the user might miss before the cmd
+:: window closes. Read this first when triaging facility issues.
 set "LOGFILE=%INSTALL_DIR%\purexs_launcher.log"
 echo. >> "%LOGFILE%"
 echo ============================================ >> "%LOGFILE%"
 echo [%date% %time%] Launcher started >> "%LOGFILE%"
 echo   Architecture: %ARCH% >> "%LOGFILE%"
 echo   Install dir:  %INSTALL_DIR% >> "%LOGFILE%"
+echo   Bundled py:   %BUNDLED_PY% >> "%LOGFILE%"
 echo   Launched from: %~f0 >> "%LOGFILE%"
 echo ============================================ >> "%LOGFILE%"
+echo.
+echo Launcher log: %LOGFILE%
+echo.
 
 echo.
 echo ========================================
@@ -74,9 +92,11 @@ if %errorlevel% neq 0 (
     )
 
     echo [%APP_NAME%] Installing Git via winget...
-    winget install --id Git.Git -e --silent --accept-package-agreements --accept-source-agreements
+    echo [%date% %time%] Running: winget install Git.Git >> "%LOGFILE%"
+    winget install --id Git.Git -e --silent --accept-package-agreements --accept-source-agreements >> "%LOGFILE%" 2>&1
     if %errorlevel% neq 0 (
-        echo [%APP_NAME%] ERROR: Failed to install Git.
+        echo [%APP_NAME%] ERROR: Failed to install Git. See %LOGFILE%.
+        echo [%date% %time%] winget install Git FAILED ^(exit !errorlevel!^) >> "%LOGFILE%"
         goto :launch_existing
     )
 
@@ -92,66 +112,82 @@ if %errorlevel% neq 0 (
 )
 
 :: ============================================================
-:: Step 2: Check/Install Python (for the decoder)
+:: Step 2: Locate Python interpreter for the decoder
+::
+:: Priority:
+::   1. Bundled Python (shipped in PureXS-releases — primary path)
+::   2. System Python on PATH (fallback for x86 or hand-rolled installs)
+::
+:: We deliberately do NOT attempt a runtime download. That path failed
+:: silently on locked-down dental-office workstations (firewalled
+:: python.org / bootstrap.pypa.io, AV inspection, no admin) and left
+:: facilities running with the 14-scanline preview without realizing
+:: the decoder was missing. If the bundle is gone, re-clone the
+:: release repo to restore it.
 :: ============================================================
-echo [%APP_NAME%] Checking Python for image decoder...
+echo [%APP_NAME%] Locating Python for image decoder...
 
 set "PYTHON_CMD="
 
-:: Check system Python
+if exist "%BUNDLED_PY%" (
+    set "PYTHON_CMD=%BUNDLED_PY%"
+    echo [%APP_NAME%] Using bundled Python: !PYTHON_CMD!
+    echo [%date% %time%] Python: bundled at %BUNDLED_PY% >> "%LOGFILE%"
+    goto :verify_python
+)
+
 where python >nul 2>&1
 if %errorlevel% equ 0 (
     set "PYTHON_CMD=python"
-    goto :python_found
+    echo [%APP_NAME%] Bundled Python missing — using system Python on PATH.
+    echo [%date% %time%] Python: system PATH ^(bundle missing at %BUNDLED_PY%^) >> "%LOGFILE%"
+    goto :verify_python
 )
 
 where python3 >nul 2>&1
 if %errorlevel% equ 0 (
     set "PYTHON_CMD=python3"
-    goto :python_found
+    echo [%APP_NAME%] Bundled Python missing — using system python3 on PATH.
+    echo [%date% %time%] Python: system PATH ^(python3, bundle missing^) >> "%LOGFILE%"
+    goto :verify_python
 )
 
-:: Check embedded Python in install dir
-if exist "%INSTALL_DIR%\python\python.exe" (
-    set "PYTHON_CMD=%INSTALL_DIR%\python\python.exe"
-    goto :python_found
+echo [%APP_NAME%] WARNING: No Python found.
+echo [%APP_NAME%]   Expected bundled interpreter at: %BUNDLED_PY%
+echo [%APP_NAME%]   Re-clone PureXS-releases to restore it, or install Python 3.11+
+echo [%APP_NAME%]   manually and ensure it's on PATH.
+echo [%APP_NAME%]   Decoder unavailable — image will fall back to scanline preview.
+echo [%date% %time%] Python: NOT FOUND ^(bundle missing, no system Python^) >> "%LOGFILE%"
+goto :skip_python
+
+:verify_python
+:: Confirm the decoder dependencies actually import. The bundle ships
+:: with everything pre-installed; this is a sanity check that catches
+:: AV-quarantined files, partial corruption, or system-Python misses.
+"%PYTHON_CMD%" -c "import numpy, cv2, PIL, scipy, pydicom" >nul 2>&1
+if %errorlevel% neq 0 (
+    echo [%APP_NAME%] Decoder dependencies missing — attempting pip repair...
+    echo [%date% %time%] Decoder deps verify FAILED, attempting repair >> "%LOGFILE%"
+    if exist "%DECODER_DIR%\requirements.txt" (
+        echo [%date% %time%] Running: pip install -r %DECODER_DIR%\requirements.txt ^(repair^) >> "%LOGFILE%"
+        "%PYTHON_CMD%" -m pip install -r "%DECODER_DIR%\requirements.txt" --no-warn-script-location >> "%LOGFILE%" 2>&1
+        "%PYTHON_CMD%" -c "import numpy, cv2, PIL, scipy, pydicom" >> "%LOGFILE%" 2>&1
+        if !errorlevel! neq 0 (
+            echo [%APP_NAME%] WARNING: Repair failed — decoder unavailable. See %LOGFILE%.
+            echo [%date% %time%] Decoder deps repair FAILED >> "%LOGFILE%"
+            set "PYTHON_CMD="
+            goto :skip_python
+        )
+        echo [%APP_NAME%] Decoder dependencies repaired.
+        echo [%date% %time%] Decoder deps repaired >> "%LOGFILE%"
+    ) else (
+        echo [%APP_NAME%] WARNING: requirements.txt missing — decoder unavailable.
+        set "PYTHON_CMD="
+        goto :skip_python
+    )
 )
-
-:: Install embedded Python (no admin needed, no system-wide install)
-echo [%APP_NAME%] Python not found. Installing embedded Python 3.11...
-set "PY_VER=3.11.9"
-
-if "%PROCESSOR_ARCHITECTURE%"=="AMD64" (
-    set "PY_URL=https://www.python.org/ftp/python/%PY_VER%/python-%PY_VER%-embed-amd64.zip"
-) else (
-    set "PY_URL=https://www.python.org/ftp/python/%PY_VER%/python-%PY_VER%-embed-win32.zip"
-)
-
-powershell -Command "Invoke-WebRequest -Uri '!PY_URL!' -OutFile '%TEMP%\python_embed.zip'"
-if not exist "%TEMP%\python_embed.zip" (
-    echo [%APP_NAME%] WARNING: Could not download Python. Decoder will be unavailable.
-    goto :skip_python
-)
-
-if not exist "%INSTALL_DIR%\python" mkdir "%INSTALL_DIR%\python"
-powershell -Command "Expand-Archive -Path '%TEMP%\python_embed.zip' -DestinationPath '%INSTALL_DIR%\python' -Force"
-del "%TEMP%\python_embed.zip" 2>nul
-
-:: Enable pip in embedded Python (uncomment import site in ._pth file)
-for %%f in ("%INSTALL_DIR%\python\python*._pth") do (
-    powershell -Command "(Get-Content '%%f') -replace '#import site','import site' | Set-Content '%%f'"
-)
-
-:: Install pip
-echo [%APP_NAME%] Installing pip...
-powershell -Command "Invoke-WebRequest -Uri 'https://bootstrap.pypa.io/get-pip.py' -OutFile '%TEMP%\get-pip.py'"
-"%INSTALL_DIR%\python\python.exe" "%TEMP%\get-pip.py" --no-warn-script-location
-del "%TEMP%\get-pip.py" 2>nul
-
-set "PYTHON_CMD=%INSTALL_DIR%\python\python.exe"
-
-:python_found
-echo [%APP_NAME%] Python: %PYTHON_CMD%
+echo [%APP_NAME%] Python verified: %PYTHON_CMD%
+echo [%date% %time%] Python verified >> "%LOGFILE%"
 goto :state_detect
 
 :skip_python
@@ -198,11 +234,12 @@ goto :launch
 :: Fresh clone (State 1)
 :: ============================================================
 :fresh_clone
-git clone --branch %BRANCH% --single-branch --depth=1 "%REPO_URL%" "%INSTALL_DIR%_tmp"
+echo [%date% %time%] Running: git clone --branch %BRANCH% --depth=1 %REPO_URL% >> "%LOGFILE%"
+git clone --branch %BRANCH% --single-branch --depth=1 "%REPO_URL%" "%INSTALL_DIR%_tmp" >> "%LOGFILE%" 2>&1
 if %errorlevel% neq 0 (
-    echo [%APP_NAME%] ERROR: Git clone failed.
-    pause
-    exit /b 1
+    echo [%APP_NAME%] ERROR: Git clone failed. See %LOGFILE%.
+    echo [%date% %time%] git clone FAILED ^(exit !errorlevel!^) >> "%LOGFILE%"
+    goto :end_pause_error
 )
 
 :: Preserve existing files (e.g. flat_field_norm.npy) if install dir exists
@@ -223,13 +260,15 @@ goto :post_install
 :post_install
 echo [%APP_NAME%] Running post-install...
 
-:: Install decoder Python dependencies
+:: Install decoder Python dependencies (no-op if bundle is intact)
 if defined PYTHON_CMD (
     if exist "%DECODER_DIR%\requirements.txt" (
         echo [%APP_NAME%] Installing decoder dependencies...
-        "%PYTHON_CMD%" -m pip install -r "%DECODER_DIR%\requirements.txt" --no-warn-script-location --quiet
+        echo [%date% %time%] Running: pip install -r %DECODER_DIR%\requirements.txt >> "%LOGFILE%"
+        "%PYTHON_CMD%" -m pip install -r "%DECODER_DIR%\requirements.txt" --no-warn-script-location >> "%LOGFILE%" 2>&1
         if %errorlevel% neq 0 (
-            echo [%APP_NAME%] Warning: Some dependencies may have failed to install.
+            echo [%APP_NAME%] Warning: Some dependencies may have failed to install. See %LOGFILE%.
+            echo [%date% %time%] pip install FAILED ^(exit !errorlevel!^) >> "%LOGFILE%"
         ) else (
             echo [%APP_NAME%] Decoder dependencies installed.
         )
@@ -291,7 +330,10 @@ echo [%APP_NAME%] Updated successfully.
 echo [%date% %time%] Updated successfully >> "%LOGFILE%"
 
 :: Re-install decoder deps in case requirements changed
-if defined PYTHON_CMD if exist "%DECODER_DIR%\requirements.txt" "%PYTHON_CMD%" -m pip install -r "%DECODER_DIR%\requirements.txt" --no-warn-script-location --quiet 2>nul
+if defined PYTHON_CMD if exist "%DECODER_DIR%\requirements.txt" (
+    echo [%date% %time%] Running: pip install -r %DECODER_DIR%\requirements.txt ^(post-update^) >> "%LOGFILE%"
+    "%PYTHON_CMD%" -m pip install -r "%DECODER_DIR%\requirements.txt" --no-warn-script-location >> "%LOGFILE%" 2>&1
+)
 
 :update_done
 popd
@@ -305,8 +347,8 @@ goto :launch
 if not exist "%EXE_PATH%" (
     echo [%APP_NAME%] ERROR: Executable not found at %EXE_PATH%
     echo [%APP_NAME%] The installation may be corrupt. Delete the install directory and re-run.
-    pause
-    exit /b 1
+    echo [%date% %time%] EXE missing: %EXE_PATH% >> "%LOGFILE%"
+    goto :end_pause_error
 )
 
 :: ------------------------------------------------------------
@@ -343,17 +385,55 @@ if not exist "%DATA_DIR%" mkdir "%DATA_DIR%"
 echo [%date% %time%] Launching %EXE_PATH% >> "%LOGFILE%"
 echo [%APP_NAME%] Launching %APP_NAME% (%ARCH%)...
 start "" "%EXE_PATH%"
-exit /b 0
+goto :end_pause_success
 
 :: ============================================================
 :: Fallback: launch whatever we have if setup fails
 :: ============================================================
 :launch_existing
 if exist "%EXE_PATH%" (
-    echo [%APP_NAME%] Attempting to launch last known version...
+    echo [%APP_NAME%] Attempting to launch last known version at %EXE_PATH%...
+    echo [%date% %time%] Fallback launch ^(setup did not complete^) >> "%LOGFILE%"
     start "" "%EXE_PATH%"
-    exit /b 0
+    goto :end_pause_warn
 )
 echo [%APP_NAME%] No existing installation found. Cannot continue.
-pause
+echo [%date% %time%] No EXE at %EXE_PATH% — cannot launch >> "%LOGFILE%"
+goto :end_pause_error
+
+:: ============================================================
+:: Exit handlers — always show log path and pause so the cmd
+:: window doesn't flash shut before the user can read what
+:: happened. The PureXS GUI launches in a separate process via
+:: `start ""`, so pausing here does not block it.
+:: ============================================================
+:end_pause_success
+echo.
+echo ============================================
+echo   %APP_NAME% launched. Log: %LOGFILE%
+echo ============================================
+echo This window will close in 8 seconds (or press any key)...
+timeout /t 8 >nul
+exit /b 0
+
+:end_pause_warn
+echo.
+echo ============================================
+echo   %APP_NAME% launched in fallback mode.
+echo   Setup did not complete cleanly — review:
+echo     %LOGFILE%
+echo ============================================
+echo This window will close in 15 seconds (or press any key)...
+timeout /t 15 >nul
+exit /b 0
+
+:end_pause_error
+echo.
+echo ============================================
+echo   %APP_NAME% setup failed.
+echo   Full log saved to:
+echo     %LOGFILE%
+echo ============================================
+echo Press any key to close this window...
+pause >nul
 exit /b 1

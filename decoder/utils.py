@@ -3,14 +3,20 @@ PureXS cross-platform utilities.
 
 Provides two functions used by every module in the PureXS suite:
 
-    get_data_dir()   Base directory for all PureXS data (logs, patients, config).
-                     macOS/Linux: ~/.purexs
-                     Windows:     %APPDATA%/PureXS  (typically C:/Users/.../AppData/Roaming/PureXS)
+    get_data_dir()   Decoder debug directory — hb_decoder.log,
+                     last_scan_raw.bin, debug_hole_*.png, flat_field_raw.bin.
+                     Windows:     %LOCALAPPDATA%/PureXS/debug
+                                  (overridable via PUREXS_DATA_DIR env var)
+                     macOS/Linux: ~/.purexs/debug
 
     open_path(path)  Open a file or folder with the OS default application.
                      macOS:   open
                      Windows: os.startfile
                      Linux:   xdg-open
+
+The Windows path mirrors the WPF host's PureXSDataPaths.Debug — both
+sides resolve PUREXS_DATA_DIR identically so the consolidated layout
+under the chosen root holds for Python and C# alike.
 """
 
 from __future__ import annotations
@@ -25,17 +31,30 @@ log = logging.getLogger("purexs.utils")
 
 
 def get_data_dir() -> Path:
-    """Return the PureXS base data directory, creating it if needed.
+    """Return the PureXS decoder debug directory, creating it if needed.
 
-    Windows: %APPDATA%/PureXS   (C:/Users/{user}/AppData/Roaming/PureXS)
-    macOS:   ~/.purexs
-    Linux:   ~/.purexs
+    Resolution order:
+      1. PUREXS_DATA_DIR env var → <that>/debug
+         (set by SetupAndRun.bat or facility-specific config; lets
+         operators relocate all PureXS data to a non-system drive
+         without touching code)
+      2. Windows: %LOCALAPPDATA%/PureXS/debug
+                  (matches WPF host's PureXSDataPaths.Debug)
+      3. macOS/Linux: ~/.purexs/debug
+
+    Was previously %APPDATA%/PureXS (Roaming) — moved into the
+    consolidated layout so big calibration/debug binaries don't sync
+    to a domain server with the user's roaming profile.
     """
-    if sys.platform == "win32":
-        base = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
-        d = base / "PureXS"
+    env_root = os.environ.get("PUREXS_DATA_DIR")
+    if env_root:
+        d = Path(env_root) / "debug"
+    elif sys.platform == "win32":
+        base = Path(os.environ.get("LOCALAPPDATA",
+                                   Path.home() / "AppData" / "Local"))
+        d = base / "PureXS" / "debug"
     else:
-        d = Path.home() / ".purexs"
+        d = Path.home() / ".purexs" / "debug"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
