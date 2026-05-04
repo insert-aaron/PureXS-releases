@@ -2157,10 +2157,14 @@ def reconstruct_image(
     # blacks, so the band stayed and read like horizontal decay across
     # multiple teeth. Sidexis preserves mid-gray there via soft-knee tone
     # mapping; raising the cap is the surgical equivalent.
+    # p1/p97 instead of p2/p99: deepens blacks (low percentile pulls in
+    # tighter on the dark end) and lifts whites (high percentile clips
+    # more of the bright tail) to close the contrast gap with Sidexis,
+    # which was reading PureXS as overall mid-grey in the A/B.
     nz = img_f[img_f > 0]
     if len(nz) > 0:
-        low = np.percentile(nz, 2)
-        high = np.percentile(nz, 99.0)  # 99.5 was too lenient — overall image read as bright/washed
+        low = np.percentile(nz, 1)
+        high = np.percentile(nz, 97)
     else:
         low, high = 0.0, 1.0
     if high <= low:
@@ -2687,30 +2691,47 @@ def reconstruct_image(
         # median pass downstream removes the resulting noise without
         # taking the anatomy with it.
         img_16 = cv2.GaussianBlur(img_16, (0, 0), sigmaX=0.3)
-        # clipLimit 1.2 → 1.5 (closer to Sidexis defaults) and tile
-        # 16×16 → 20×20 for finer local adaptation. Smaller tiles light
-        # up trabecular pattern in flat bone regions which is the
-        # "Sidexis HD" signature on root anatomy.
-        clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(20, 20))
+        # clipLimit 1.5 → 2.5 to push more local contrast through CLAHE,
+        # paired with the tighter p1/p97 percentile stretch above.
+        # Together they close the mid-grey gap with Sidexis. tile 20×20
+        # kept — finer local adaptation lights up trabecular pattern in
+        # flat bone regions, which is the "Sidexis HD" signature on root
+        # anatomy.
+        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(20, 20))
         img_16 = clahe.apply(img_16)
     except ImportError:
         pass
     img_8 = (img_16 >> 8).astype(np.uint8)
 
     # Edge-preserving denoise — bridges grain in flat bone/soft-tissue
-    # while leaving sharp anatomy alone. sigmaColor 40 → 25 (~10%
-    # intensity tolerance) restores root-tip and enamel sharpness that
-    # the previous setting was smearing into surrounding tissue;
-    # the AI A/B against Sidexis flagged this as the dominant softness
-    # contributor. Keep d=9 spatial reach so flat bone still smooths.
-    # 3×3 median blur removed — it was the second softness contributor
-    # (collapsing the trabecular-bone texture and apex detail) and noise
-    # is already clean enough without it on the current scans.
+    # while leaving sharp anatomy alone. sigmaColor settled at 30 — the
+    # midpoint between the original 40 (over-smoothed root tips/enamel
+    # per the Sidexis A/B) and 25 (left enough noise to crater the
+    # die-junction seam detector's column-consensus calculation, which
+    # dropped from 75% to 56% on Aguilar 2026-05-04 18:04). 30 keeps
+    # enamel/apex detail while preserving enough column coherence for
+    # consensus-based seam detection downstream. d=9 spatial reach
+    # kept; 3×3 median blur stays out (collapsed trabecular texture).
     try:
         import cv2 as _cv2_bf
-        img_8 = _cv2_bf.bilateralFilter(img_8, d=9, sigmaColor=25, sigmaSpace=10)
+        img_8 = _cv2_bf.bilateralFilter(img_8, d=9, sigmaColor=30, sigmaSpace=10)
     except ImportError:
         pass
+
+    # ── Wide dead-row gradient at rows 424-428 ────────────────────────
+    # Earlier per-row interpolation only spans 2 rows at the dead-zone
+    # boundary, which leaves a faint horizontal step that bilateral +
+    # CLAHE amplify into a visible band. Replace the 5-row stretch with
+    # a linear gradient between the healthy rows on each side
+    # (img_8[423] → img_8[429]). Acts on the final 8-bit post-bilateral
+    # image so the smoothed gradient survives all subsequent
+    # processing through to output.
+    if img_8.shape[0] > 429:
+        img_8[424:429, :] = np.linspace(
+            img_8[423, :].astype(np.float32),
+            img_8[429, :].astype(np.float32),
+            7,
+        )[1:-1].astype(np.uint8)
 
     # ── Die-junction horizontal seam suppression (post-CLAHE) ─────────
     # Two-die detector leaves a 1-3% gain step where dies meet; CLAHE
