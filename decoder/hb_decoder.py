@@ -2160,7 +2160,7 @@ def reconstruct_image(
     nz = img_f[img_f > 0]
     if len(nz) > 0:
         low = np.percentile(nz, 2)
-        high = np.percentile(nz, 99.5)
+        high = np.percentile(nz, 99.0)  # 99.5 was too lenient — overall image read as bright/washed
     else:
         low, high = 0.0, 1.0
     if high <= low:
@@ -2682,11 +2682,16 @@ def reconstruct_image(
     img_16 = (normalized * 65535).astype(np.uint16)
     try:
         import cv2
-        img_16 = cv2.GaussianBlur(img_16, (0, 0), sigmaX=0.6)
-        # clipLimit lowered 1.8 → 1.2 to stop CLAHE from amplifying shot
-        # noise into visible grain. Crispness recovered post-bilateral
-        # via the unsharp mask below.
-        clahe = cv2.createCLAHE(clipLimit=1.2, tileGridSize=(16, 16))
+        # Pre-CLAHE blur dropped (sigma 0.6 → 0.3) to preserve more
+        # high-frequency detail going INTO CLAHE — the bilateral +
+        # median pass downstream removes the resulting noise without
+        # taking the anatomy with it.
+        img_16 = cv2.GaussianBlur(img_16, (0, 0), sigmaX=0.3)
+        # clipLimit 1.2 → 1.5 (closer to Sidexis defaults) and tile
+        # 16×16 → 20×20 for finer local adaptation. Smaller tiles light
+        # up trabecular pattern in flat bone regions which is the
+        # "Sidexis HD" signature on root anatomy.
+        clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(20, 20))
         img_16 = clahe.apply(img_16)
     except ImportError:
         pass
@@ -2699,7 +2704,13 @@ def reconstruct_image(
     # d=5/sigmaColor=18 version still left visible grain.
     try:
         import cv2 as _cv2_bf
-        img_8 = _cv2_bf.bilateralFilter(img_8, d=7, sigmaColor=30, sigmaSpace=5)
+        # Wider kernel (d=9) + higher sigmaColor (40) + larger sigmaSpace (10)
+        # extend the smoothing reach inside flat bone/root regions while the
+        # color tolerance still respects tooth/cortical edges. Followed by a
+        # 3x3 median blur to kill isolated speckle specks without smearing
+        # legitimate fine structure.
+        img_8 = _cv2_bf.bilateralFilter(img_8, d=9, sigmaColor=40, sigmaSpace=10)
+        img_8 = _cv2_bf.medianBlur(img_8, 3)
     except ImportError:
         pass
 
@@ -2719,8 +2730,14 @@ def reconstruct_image(
         # Computed per column. A real hardware step has consistent sign
         # across columns; anatomy has mixed signs.
         _STEP_W = 10
-        _search_lo = height // 4
-        _search_hi = height * 3 // 4
+        # Restricted to the expected DX41 die-boundary band (~44% of height).
+        # The previous wide search (height // 4 to height * 3 // 4) was
+        # latching onto the airway/palate boundary at ~62% of height, which
+        # has a strong row-coherent gradient because anatomy is uniform
+        # across the panoramic arch. The hardware seam itself sits much
+        # closer to the geometric mid-row.
+        _search_lo = int(height * 0.40)   # ~526 on a 1316-tall sensor
+        _search_hi = int(height * 0.48)   # ~631
         _best_row = -1
         _best_signed_mean = 0.0
         _best_consensus = 0.0
@@ -2743,9 +2760,17 @@ def reconstruct_image(
         # average step is at least 5 units. Anatomical row gradients
         # rarely exceed 70% column consensus because curved features
         # (jaw arch, sinus floor) push columns in different directions.
-        if _best_row > 0 and _best_consensus >= 0.80 and abs(_best_signed_mean) >= 5.0:
+        # Magnitude cap: a real die-junction step is 1-3% of mean signal,
+        # which on 8-bit post-CLAHE/bilateral data is ~3-8 grey levels. A
+        # step of >8 is anatomy (e.g. row 825 / step=-13.4 was the airway
+        # boundary masquerading as a die seam — visible bright band on
+        # the 2026-05-04 12:20 scan).
+        if (_best_row > 0
+                and _best_consensus >= 0.80
+                and abs(_best_signed_mean) >= 5.0
+                and abs(_best_signed_mean) <= 8.0):
             _offset = float(_best_signed_mean)
-            _offset = max(-25.0, min(25.0, _offset))
+            _offset = max(-8.0, min(8.0, _offset))
             # Refine step location: the smooth-step detector finds the
             # window center; zoom into a ±10 row window and find the
             # actual sharpest 2-row transition. The seam in the final
@@ -2824,12 +2849,20 @@ def reconstruct_image(
         img_pil = img_pil.crop((crop_l, crop_t, crop_r, crop_b))
         img_pil = img_pil.resize((2440, 1280), Image.Resampling.LANCZOS)
 
-    # ── Unsharp mask ────────────────────────────────────────────────
-    # percent 110 → 75, threshold 3 → 5: bilateral filter removed the
-    # high-freq grain that the previous aggressive sharpen was
-    # amplifying. Threshold=5 keeps flat bone from being re-roughened.
+    # ── Two-stage unsharp mask (Sidexis-style multi-scale sharpening) ──
+    # Pass 1 — mid-frequency boost (radius=4): adds "punch" to anatomy
+    # at the trabecular / root-canal scale. This is the missing piece
+    # that was making the previous output look soft compared to Sidexis;
+    # a single small-radius unsharp can't reach that frequency band.
+    # threshold=8 keeps the boost off flat bone so grain doesn't return.
+    # Pass 2 — fine edges (radius=1.5): existing tooth/cortical sharpen,
+    # percent dropped 100 → 75 because the mid-pass already did most of
+    # the visible work.
     try:
         from PIL import ImageFilter
+        img_pil = img_pil.filter(
+            ImageFilter.UnsharpMask(radius=4, percent=45, threshold=8)
+        )
         img_pil = img_pil.filter(
             ImageFilter.UnsharpMask(radius=1.5, percent=75, threshold=5)
         )
