@@ -2151,10 +2151,16 @@ def reconstruct_image(
         log.info("Row repair: %d rows interpolated", len(spike_rows))
 
     # ── Percentile contrast stretch ────────────────────────────────────
+    # high lifted 98 → 99.5: the top 2% clip was crushing the high-signal
+    # soft-tissue region (palate/gum area above the upper crowns) to a
+    # pure-black band after invert. CLAHE can't redistribute pure-flat
+    # blacks, so the band stayed and read like horizontal decay across
+    # multiple teeth. Sidexis preserves mid-gray there via soft-knee tone
+    # mapping; raising the cap is the surgical equivalent.
     nz = img_f[img_f > 0]
     if len(nz) > 0:
         low = np.percentile(nz, 2)
-        high = np.percentile(nz, 98)
+        high = np.percentile(nz, 99.5)
     else:
         low, high = 0.0, 1.0
     if high <= low:
