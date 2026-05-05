@@ -2651,13 +2651,27 @@ def reconstruct_image(
         _anchor_gain = float(np.median(_batch_gains))
         if _anchor_gain > 1e-6:
             _batch_gains = _batch_gains / _anchor_gain
+        # Expand batch-level gains to a per-column array, then smooth
+        # across the column axis so transitions between adjacent batches
+        # ramp instead of step. Without this smoothing the constant gain
+        # within each batch produces a discontinuity at every boundary
+        # (Aguilar 2026-05-04 18:04 cum_gains spread 0.96-1.06 → 10%
+        # boundary jumps, visible as faint horizontal banding).
+        _col_gain_map = np.ones(width, dtype=np.float64)
         for (s, e), g in zip(zip(_bs_full, _be_full), _batch_gains):
-            if e <= s or abs(g - 1.0) < 1e-3:
-                continue
-            normalized[:, s:e] = np.clip(normalized[:, s:e] * float(g), 0.0, 1.0)
-        log.info("Seam-gain stitching: ratios=[%s] cum_gains=[%s]",
+            if e > s:
+                _col_gain_map[s:e] = g
+        _col_gain_smooth = _gf1d_col(_col_gain_map, sigma=5.0)
+        normalized = np.clip(
+            normalized * _col_gain_smooth[np.newaxis, :].astype(np.float32),
+            0.0, 1.0,
+        )
+        log.info("Seam-gain stitching: ratios=[%s] cum_gains=[%s] "
+                 "smoothed (sigma=5) → range [%.4f, %.4f]",
                  ", ".join(f"{r:.4f}" for r in _ratios),
-                 ", ".join(f"{g:.4f}" for g in _batch_gains.tolist()))
+                 ", ".join(f"{g:.4f}" for g in _batch_gains.tolist()),
+                 float(_col_gain_smooth.min()),
+                 float(_col_gain_smooth.max()))
 
     _dump_stage("04b_post_batch_gain", normalized)
 
@@ -2745,6 +2759,13 @@ def reconstruct_image(
     if _exp_col_hi > _exp_col_lo + 100:
         from scipy.ndimage import gaussian_filter1d as _gf1d_row
         _band = img_8[:, _exp_col_lo:_exp_col_hi + 1].astype(np.float32)
+        # Pre-smooth along the row axis (sigma=2) BEFORE computing
+        # per-column steps. Denoises the consensus calculation so a
+        # real hardware step shows up as same-sign across columns even
+        # with high-frequency residual content. Smoothed _band is used
+        # only for detection — the actual offset is applied to the
+        # un-smoothed img_8, so anatomy detail is preserved in output.
+        _band = _gf1d_row(_band, sigma=2.0, axis=0, mode="nearest")
         # Per-row step at row r = mean(rows r..r+9) - mean(rows r-10..r-1)
         # Computed per column. A real hardware step has consistent sign
         # across columns; anatomy has mixed signs.
@@ -2776,10 +2797,11 @@ def reconstruct_image(
                 _best_signed_mean = _signed_mean
                 _best_row = _r
         # Trigger thresholds:
-        #   consensus ≥ 0.70 — anatomical row gradients within the
-        #     central 40-48% band rarely break 70% column consensus
-        #     because curved features (jaw arch, sinus floor) push
-        #     columns in different directions
+        #   consensus ≥ 0.60 — with the row-axis pre-smoothing above,
+        #     real hardware steps reliably hit higher consensus, so
+        #     the threshold can drop without taking on more anatomy
+        #     false-positives. Aguilar 2026-05-04 18:04 measured 56%
+        #     un-smoothed; pre-smoothing should push that >60%.
         #   4 ≤ |step| ≤ 14 — die-junction step on 8-bit post-CLAHE
         #     data ranges 4-14 grey levels depending on detector and
         #     bilateral strength. Earlier airway false-positive at row
@@ -2790,7 +2812,7 @@ def reconstruct_image(
         # rejected by the previous tighter thresholds — the white
         # center line in that scan motivated this loosening.
         if (_best_row > 0
-                and _best_consensus >= 0.70
+                and _best_consensus >= 0.60
                 and abs(_best_signed_mean) >= 4.0
                 and abs(_best_signed_mean) <= 14.0):
             _offset = float(_best_signed_mean)
