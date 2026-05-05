@@ -2163,8 +2163,8 @@ def reconstruct_image(
     # which was reading PureXS as overall mid-grey in the A/B.
     nz = img_f[img_f > 0]
     if len(nz) > 0:
-        low = np.percentile(nz, 3)
-        high = np.percentile(nz, 94)
+        low = np.percentile(nz, 2)
+        high = np.percentile(nz, 95)
     else:
         low, high = 0.0, 1.0
     if high <= low:
