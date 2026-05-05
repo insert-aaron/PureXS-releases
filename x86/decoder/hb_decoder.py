@@ -2651,27 +2651,13 @@ def reconstruct_image(
         _anchor_gain = float(np.median(_batch_gains))
         if _anchor_gain > 1e-6:
             _batch_gains = _batch_gains / _anchor_gain
-        # Expand batch-level gains to a per-column array, then smooth
-        # across the column axis so transitions between adjacent batches
-        # ramp instead of step. Without this smoothing the constant gain
-        # within each batch produces a discontinuity at every boundary
-        # (Aguilar 2026-05-04 18:04 cum_gains spread 0.96-1.06 → 10%
-        # boundary jumps, visible as faint horizontal banding).
-        _col_gain_map = np.ones(width, dtype=np.float64)
         for (s, e), g in zip(zip(_bs_full, _be_full), _batch_gains):
-            if e > s:
-                _col_gain_map[s:e] = g
-        _col_gain_smooth = _gf1d_col(_col_gain_map, sigma=5.0)
-        normalized = np.clip(
-            normalized * _col_gain_smooth[np.newaxis, :].astype(np.float32),
-            0.0, 1.0,
-        )
-        log.info("Seam-gain stitching: ratios=[%s] cum_gains=[%s] "
-                 "smoothed (sigma=5) → range [%.4f, %.4f]",
+            if e <= s or abs(g - 1.0) < 1e-3:
+                continue
+            normalized[:, s:e] = np.clip(normalized[:, s:e] * float(g), 0.0, 1.0)
+        log.info("Seam-gain stitching: ratios=[%s] cum_gains=[%s]",
                  ", ".join(f"{r:.4f}" for r in _ratios),
-                 ", ".join(f"{g:.4f}" for g in _batch_gains.tolist()),
-                 float(_col_gain_smooth.min()),
-                 float(_col_gain_smooth.max()))
+                 ", ".join(f"{g:.4f}" for g in _batch_gains.tolist()))
 
     _dump_stage("04b_post_batch_gain", normalized)
 
@@ -2708,38 +2694,29 @@ def reconstruct_image(
         # clipLimit 1.5 → 2.5 to push more local contrast through CLAHE,
         # paired with the tighter p1/p97 percentile stretch above.
         # Together they close the mid-grey gap with Sidexis. tile 20×20
-        # kept — finer local adaptation lights up trabecular pattern in
-        # flat bone regions, which is the "Sidexis HD" signature on root
-        # anatomy.
-        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(20, 20))
+        # → 8×8: smaller tiles give finer local adaptation, lighting up
+        # trabecular pattern in flat bone — the "Sidexis HD" signature
+        # on root anatomy. Single-variable test on top of an otherwise
+        # literal 6041ae1 baseline (NLM/aggressive-unsharp/seam-pre-
+        # smooth/batch-gain-smooth all reverted out).
+        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
         img_16 = clahe.apply(img_16)
     except ImportError:
         pass
     img_8 = (img_16 >> 8).astype(np.uint8)
 
-    # Edge-preserving denoise — Non-Local Means.
-    #
-    # Replaced bilateralFilter (d=5, sigmaColor=30, sigmaSpace=5) which
-    # had stopped being effective: at d=5 it didn't suppress detector
-    # photon noise, and the aggressive unsharp downstream then
-    # amplified that noise instead of amplifying edges. The earlier
-    # d=9 setting smoothed too much fine structure (periodontal
-    # ligament, trabecular pattern, lamina dura). NLM is what high-end
-    # dental software uses — removes noise while preserving edges far
-    # better than bilateral at any d.
-    #
-    # h=4: filter strength (lower preserves more detail, higher removes
-    #   more noise). 4 sits at the conservative end so root-canal lumen
-    #   and trabecular pattern survive.
-    # templateWindowSize=7, searchWindowSize=21: standard radiographic
-    #   defaults — 7×7 patch matched against patches in a 21×21
-    #   neighborhood. Costs ~2s/scan but is far better at preserving
-    #   structural borders.
+    # Edge-preserving denoise — bridges grain in flat bone/soft-tissue
+    # while leaving sharp anatomy alone. sigmaColor settled at 30 — the
+    # midpoint between the original 40 (over-smoothed root tips/enamel
+    # per the Sidexis A/B) and 25 (left enough noise to crater the
+    # die-junction seam detector's column-consensus calculation, which
+    # dropped from 75% to 56% on Aguilar 2026-05-04 18:04). 30 keeps
+    # enamel/apex detail while preserving enough column coherence for
+    # consensus-based seam detection downstream. d=9 spatial reach
+    # kept; 3×3 median blur stays out (collapsed trabecular texture).
     try:
         import cv2 as _cv2_bf
-        img_8 = _cv2_bf.fastNlMeansDenoising(
-            img_8, h=4, templateWindowSize=7, searchWindowSize=21,
-        )
+        img_8 = _cv2_bf.bilateralFilter(img_8, d=9, sigmaColor=30, sigmaSpace=10)
     except ImportError:
         pass
 
@@ -2770,13 +2747,6 @@ def reconstruct_image(
     if _exp_col_hi > _exp_col_lo + 100:
         from scipy.ndimage import gaussian_filter1d as _gf1d_row
         _band = img_8[:, _exp_col_lo:_exp_col_hi + 1].astype(np.float32)
-        # Pre-smooth along the row axis (sigma=2) BEFORE computing
-        # per-column steps. Denoises the consensus calculation so a
-        # real hardware step shows up as same-sign across columns even
-        # with high-frequency residual content. Smoothed _band is used
-        # only for detection — the actual offset is applied to the
-        # un-smoothed img_8, so anatomy detail is preserved in output.
-        _band = _gf1d_row(_band, sigma=2.0, axis=0, mode="nearest")
         # Per-row step at row r = mean(rows r..r+9) - mean(rows r-10..r-1)
         # Computed per column. A real hardware step has consistent sign
         # across columns; anatomy has mixed signs.
@@ -2808,11 +2778,10 @@ def reconstruct_image(
                 _best_signed_mean = _signed_mean
                 _best_row = _r
         # Trigger thresholds:
-        #   consensus ≥ 0.60 — with the row-axis pre-smoothing above,
-        #     real hardware steps reliably hit higher consensus, so
-        #     the threshold can drop without taking on more anatomy
-        #     false-positives. Aguilar 2026-05-04 18:04 measured 56%
-        #     un-smoothed; pre-smoothing should push that >60%.
+        #   consensus ≥ 0.70 — anatomical row gradients within the
+        #     central 40-48% band rarely break 70% column consensus
+        #     because curved features (jaw arch, sinus floor) push
+        #     columns in different directions
         #   4 ≤ |step| ≤ 14 — die-junction step on 8-bit post-CLAHE
         #     data ranges 4-14 grey levels depending on detector and
         #     bilateral strength. Earlier airway false-positive at row
@@ -2823,7 +2792,7 @@ def reconstruct_image(
         # rejected by the previous tighter thresholds — the white
         # center line in that scan motivated this loosening.
         if (_best_row > 0
-                and _best_consensus >= 0.60
+                and _best_consensus >= 0.70
                 and abs(_best_signed_mean) >= 4.0
                 and abs(_best_signed_mean) <= 14.0):
             _offset = float(_best_signed_mean)
@@ -2906,20 +2875,22 @@ def reconstruct_image(
         img_pil = img_pil.crop((crop_l, crop_t, crop_r, crop_b))
         img_pil = img_pil.resize((2440, 1280), Image.Resampling.LANCZOS)
 
-    # ── Single-pass unsharp mask (Sidexis-style final sharpen) ────────
-    # radius=1.5, percent=120, threshold=2.
-    #   percent dropped 160 → 120: 160 was amplifying noise rather than
-    #     edges when paired with the previous d=5 bilateral. With NLM
-    #     denoising upstream giving a cleaner base, 120 is enough to
-    #     recover razor enamel/cortical edges without re-introducing
-    #     speckle.
-    #   radius 1 → 1.5: slightly broader unsharp scale matches the
-    #     anatomical edge frequencies better than radius=1.
-    #   threshold=2 kept — keeps the boost off truly flat regions.
+    # ── Two-stage unsharp mask (Sidexis-style multi-scale sharpening) ──
+    # Pass 1 — mid-frequency boost (radius=4): adds "punch" to anatomy
+    # at the trabecular / root-canal scale. This is the missing piece
+    # that was making the previous output look soft compared to Sidexis;
+    # a single small-radius unsharp can't reach that frequency band.
+    # threshold=8 keeps the boost off flat bone so grain doesn't return.
+    # Pass 2 — fine edges (radius=1.5): existing tooth/cortical sharpen,
+    # percent dropped 100 → 75 because the mid-pass already did most of
+    # the visible work.
     try:
         from PIL import ImageFilter
         img_pil = img_pil.filter(
-            ImageFilter.UnsharpMask(radius=1.5, percent=120, threshold=2)
+            ImageFilter.UnsharpMask(radius=4, percent=45, threshold=8)
+        )
+        img_pil = img_pil.filter(
+            ImageFilter.UnsharpMask(radius=1.5, percent=75, threshold=5)
         )
     except Exception:
         pass
