@@ -2718,17 +2718,21 @@ def reconstruct_image(
     img_8 = (img_16 >> 8).astype(np.uint8)
 
     # Edge-preserving denoise — bridges grain in flat bone/soft-tissue
-    # while leaving sharp anatomy alone. sigmaColor settled at 30 — the
-    # midpoint between the original 40 (over-smoothed root tips/enamel
-    # per the Sidexis A/B) and 25 (left enough noise to crater the
-    # die-junction seam detector's column-consensus calculation, which
-    # dropped from 75% to 56% on Aguilar 2026-05-04 18:04). 30 keeps
-    # enamel/apex detail while preserving enough column coherence for
-    # consensus-based seam detection downstream. d=9 spatial reach
-    # kept; 3×3 median blur stays out (collapsed trabecular texture).
+    # while leaving sharp anatomy alone.
+    #   d=5 (was 9): narrower spatial kernel that only smooths locally
+    #     so fine periodic structure (periodontal ligament space,
+    #     trabecular pattern, lamina dura, root canal lumen) survives.
+    #     d=9 was the main reason these were getting blended away
+    #     vs. Sidexis.
+    #   sigmaSpace=5 (was 10): paired drop with d so the falloff
+    #     matches the smaller kernel.
+    #   sigmaColor=30: kept — the midpoint that preserves enamel/apex
+    #     detail while leaving enough column coherence for the
+    #     downstream seam detector's consensus calculation.
+    # 3×3 median blur stays out (collapsed trabecular texture).
     try:
         import cv2 as _cv2_bf
-        img_8 = _cv2_bf.bilateralFilter(img_8, d=9, sigmaColor=30, sigmaSpace=10)
+        img_8 = _cv2_bf.bilateralFilter(img_8, d=5, sigmaColor=30, sigmaSpace=5)
     except ImportError:
         pass
 
@@ -2895,22 +2899,17 @@ def reconstruct_image(
         img_pil = img_pil.crop((crop_l, crop_t, crop_r, crop_b))
         img_pil = img_pil.resize((2440, 1280), Image.Resampling.LANCZOS)
 
-    # ── Two-stage unsharp mask (Sidexis-style multi-scale sharpening) ──
-    # Pass 1 — mid-frequency boost (radius=4): adds "punch" to anatomy
-    # at the trabecular / root-canal scale. This is the missing piece
-    # that was making the previous output look soft compared to Sidexis;
-    # a single small-radius unsharp can't reach that frequency band.
-    # threshold=8 keeps the boost off flat bone so grain doesn't return.
-    # Pass 2 — fine edges (radius=1.5): existing tooth/cortical sharpen,
-    # percent dropped 100 → 75 because the mid-pass already did most of
-    # the visible work.
+    # ── Aggressive single-pass unsharp mask (Sidexis-style) ───────────
+    # radius=1.0, percent=160, threshold=2 — a tighter, much stronger
+    # high-frequency boost than the prior two-stage setup. Recovers the
+    # razor enamel edges Sidexis produces at its final sharpening step
+    # and re-extracts fine detail that even the now-narrower bilateral
+    # (d=5, sigmaSpace=5) still slightly attenuates. threshold=2 keeps
+    # the boost off truly flat regions so grain doesn't come back.
     try:
         from PIL import ImageFilter
         img_pil = img_pil.filter(
-            ImageFilter.UnsharpMask(radius=4, percent=45, threshold=8)
-        )
-        img_pil = img_pil.filter(
-            ImageFilter.UnsharpMask(radius=1.5, percent=75, threshold=5)
+            ImageFilter.UnsharpMask(radius=1, percent=160, threshold=2)
         )
     except Exception:
         pass
