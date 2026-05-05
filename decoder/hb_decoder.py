@@ -2166,7 +2166,7 @@ def reconstruct_image(
         _right_mean = float(img_f[:, _seam_col_pre:_seam_col_pre + _GAIN_WINDOW].mean())
         if _right_mean > 1e-6:
             _gain = _left_mean / _right_mean
-            if _gain < 0.97 or _gain > 1.03:
+            if _gain < 0.985 or _gain > 1.015:
                 _float_max = float(np.finfo(np.float32).max)
                 img_f[:, _seam_col_pre:] = np.minimum(
                     img_f[:, _seam_col_pre:] * _gain, _float_max,
