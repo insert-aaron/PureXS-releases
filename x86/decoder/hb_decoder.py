@@ -2717,22 +2717,29 @@ def reconstruct_image(
         pass
     img_8 = (img_16 >> 8).astype(np.uint8)
 
-    # Edge-preserving denoise — bridges grain in flat bone/soft-tissue
-    # while leaving sharp anatomy alone.
-    #   d=5 (was 9): narrower spatial kernel that only smooths locally
-    #     so fine periodic structure (periodontal ligament space,
-    #     trabecular pattern, lamina dura, root canal lumen) survives.
-    #     d=9 was the main reason these were getting blended away
-    #     vs. Sidexis.
-    #   sigmaSpace=5 (was 10): paired drop with d so the falloff
-    #     matches the smaller kernel.
-    #   sigmaColor=30: kept — the midpoint that preserves enamel/apex
-    #     detail while leaving enough column coherence for the
-    #     downstream seam detector's consensus calculation.
-    # 3×3 median blur stays out (collapsed trabecular texture).
+    # Edge-preserving denoise — Non-Local Means.
+    #
+    # Replaced bilateralFilter (d=5, sigmaColor=30, sigmaSpace=5) which
+    # had stopped being effective: at d=5 it didn't suppress detector
+    # photon noise, and the aggressive unsharp downstream then
+    # amplified that noise instead of amplifying edges. The earlier
+    # d=9 setting smoothed too much fine structure (periodontal
+    # ligament, trabecular pattern, lamina dura). NLM is what high-end
+    # dental software uses — removes noise while preserving edges far
+    # better than bilateral at any d.
+    #
+    # h=4: filter strength (lower preserves more detail, higher removes
+    #   more noise). 4 sits at the conservative end so root-canal lumen
+    #   and trabecular pattern survive.
+    # templateWindowSize=7, searchWindowSize=21: standard radiographic
+    #   defaults — 7×7 patch matched against patches in a 21×21
+    #   neighborhood. Costs ~2s/scan but is far better at preserving
+    #   structural borders.
     try:
         import cv2 as _cv2_bf
-        img_8 = _cv2_bf.bilateralFilter(img_8, d=5, sigmaColor=30, sigmaSpace=5)
+        img_8 = _cv2_bf.fastNlMeansDenoising(
+            img_8, h=4, templateWindowSize=7, searchWindowSize=21,
+        )
     except ImportError:
         pass
 
@@ -2899,17 +2906,20 @@ def reconstruct_image(
         img_pil = img_pil.crop((crop_l, crop_t, crop_r, crop_b))
         img_pil = img_pil.resize((2440, 1280), Image.Resampling.LANCZOS)
 
-    # ── Aggressive single-pass unsharp mask (Sidexis-style) ───────────
-    # radius=1.0, percent=160, threshold=2 — a tighter, much stronger
-    # high-frequency boost than the prior two-stage setup. Recovers the
-    # razor enamel edges Sidexis produces at its final sharpening step
-    # and re-extracts fine detail that even the now-narrower bilateral
-    # (d=5, sigmaSpace=5) still slightly attenuates. threshold=2 keeps
-    # the boost off truly flat regions so grain doesn't come back.
+    # ── Single-pass unsharp mask (Sidexis-style final sharpen) ────────
+    # radius=1.5, percent=120, threshold=2.
+    #   percent dropped 160 → 120: 160 was amplifying noise rather than
+    #     edges when paired with the previous d=5 bilateral. With NLM
+    #     denoising upstream giving a cleaner base, 120 is enough to
+    #     recover razor enamel/cortical edges without re-introducing
+    #     speckle.
+    #   radius 1 → 1.5: slightly broader unsharp scale matches the
+    #     anatomical edge frequencies better than radius=1.
+    #   threshold=2 kept — keeps the boost off truly flat regions.
     try:
         from PIL import ImageFilter
         img_pil = img_pil.filter(
-            ImageFilter.UnsharpMask(radius=1, percent=160, threshold=2)
+            ImageFilter.UnsharpMask(radius=1.5, percent=120, threshold=2)
         )
     except Exception:
         pass
