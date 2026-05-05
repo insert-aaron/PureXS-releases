@@ -2720,19 +2720,21 @@ def reconstruct_image(
     except ImportError:
         pass
 
-    # ── Wide dead-row gradient at rows 424-428 ────────────────────────
-    # Earlier per-row interpolation only spans 2 rows at the dead-zone
-    # boundary, which leaves a faint horizontal step that bilateral +
-    # CLAHE amplify into a visible band. Replace the 5-row stretch with
-    # a linear gradient between the healthy rows on each side
-    # (img_8[423] → img_8[429]). Acts on the final 8-bit post-bilateral
-    # image so the smoothed gradient survives all subsequent
-    # processing through to output.
-    if img_8.shape[0] > 429:
-        img_8[424:429, :] = np.linspace(
-            img_8[423, :].astype(np.float32),
-            img_8[429, :].astype(np.float32),
-            7,
+    # ── Wide dead-row gradient at rows 422-432 (11 rows) ──────────────
+    # Tightening percentile to p3/p94 + clipLimit=2.5 + tile (8,8)
+    # exposes more local contrast than the prior 5-row stretch could
+    # absorb, so the residual step between the two scan halves
+    # re-appears as a horizontal band across the upper-third (cuts
+    # through maxillary roots and sinus floor — clinically disruptive).
+    # Widen to 11 rows AND use the mean of 5 healthy rows above/below
+    # as anchors instead of single-row values; spreading the brightness
+    # transition over 11 rows with robust anchors makes the step
+    # invisible at p3/p94 contrast.
+    if img_8.shape[0] > 437:
+        _top_anchor = img_8[417:422, :].astype(np.float32).mean(axis=0)
+        _bot_anchor = img_8[433:438, :].astype(np.float32).mean(axis=0)
+        img_8[422:433, :] = np.linspace(
+            _top_anchor, _bot_anchor, 13,
         )[1:-1].astype(np.uint8)
 
     # ── Die-junction horizontal seam suppression (post-CLAHE) ─────────
