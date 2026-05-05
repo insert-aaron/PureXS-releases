@@ -2150,58 +2150,6 @@ def reconstruct_image(
     if spike_rows:
         log.info("Row repair: %d rows interpolated", len(spike_rows))
 
-    # ── Pre-CLAHE column-gain seam normalization ──────────────────────
-    # Detect a brightness mismatch between the two halves of the scan
-    # at the seam column (geometric center of active exposure) and
-    # rescale the right half so its mean matches the left half. Operates
-    # on the float32 img_f BEFORE the percentile clip and CLAHE so the
-    # downstream contrast stretch sees a unified histogram across the
-    # full panoramic instead of two halves with different gain. Skipped
-    # when the two halves are already within 3% (gain ∈ [0.97, 1.03]).
-    #
-    # Sampling is restricted to rows 50-200 (upper bone/skull region
-    # above the teeth) where left/right anatomy is naturally most
-    # symmetric — including the full image height let teeth/sinus/jaw
-    # asymmetry contaminate the brightness reference. Window narrowed
-    # 40 → 20 cols/side for the same reason: a tighter band closer to
-    # the seam captures the calibration mismatch cleanly without
-    # picking up anatomical brightness drift further from the midline.
-    _seam_col_pre = (_exp_col_lo + _exp_col_hi) // 2
-    _GAIN_WINDOW = 20
-    _GAIN_ROW_LO = 50
-    _GAIN_ROW_HI = 200
-    if (_seam_col_pre - _GAIN_WINDOW >= 0
-            and _seam_col_pre + _GAIN_WINDOW <= width
-            and _GAIN_ROW_HI <= height):
-        _left_mean  = float(
-            img_f[_GAIN_ROW_LO:_GAIN_ROW_HI,
-                  _seam_col_pre - _GAIN_WINDOW:_seam_col_pre].mean()
-        )
-        _right_mean = float(
-            img_f[_GAIN_ROW_LO:_GAIN_ROW_HI,
-                  _seam_col_pre:_seam_col_pre + _GAIN_WINDOW].mean()
-        )
-        if _right_mean > 1e-6:
-            _gain = _left_mean / _right_mean
-            if _gain < 0.97 or _gain > 1.03:
-                _float_max = float(np.finfo(np.float32).max)
-                img_f[:, _seam_col_pre:] = np.minimum(
-                    img_f[:, _seam_col_pre:] * _gain, _float_max,
-                ).astype(np.float32)
-                log.info(
-                    "Pre-CLAHE seam gain norm: seam=%d rows=%d-%d "
-                    "left=%.1f right=%.1f gain=%.4f applied to right half",
-                    _seam_col_pre, _GAIN_ROW_LO, _GAIN_ROW_HI,
-                    _left_mean, _right_mean, _gain,
-                )
-            else:
-                log.info(
-                    "Pre-CLAHE seam gain norm: seam=%d rows=%d-%d "
-                    "left=%.1f right=%.1f gain=%.4f within ±3%% — skipped",
-                    _seam_col_pre, _GAIN_ROW_LO, _GAIN_ROW_HI,
-                    _left_mean, _right_mean, _gain,
-                )
-
     # ── Percentile contrast stretch ────────────────────────────────────
     # high lifted 98 → 99.5: the top 2% clip was crushing the high-signal
     # soft-tissue region (palate/gum area above the upper crowns) to a
@@ -2768,7 +2716,7 @@ def reconstruct_image(
     # kept; 3×3 median blur stays out (collapsed trabecular texture).
     try:
         import cv2 as _cv2_bf
-        img_8 = _cv2_bf.bilateralFilter(img_8, d=9, sigmaColor=18, sigmaSpace=18)
+        img_8 = _cv2_bf.bilateralFilter(img_8, d=7, sigmaColor=25, sigmaSpace=15)
     except ImportError:
         pass
 
