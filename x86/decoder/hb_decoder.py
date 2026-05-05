@@ -2860,6 +2860,25 @@ def reconstruct_image(
                  float(_diff[:, _blur_mask].mean()) if _blur_mask.any() else 0.0)
         img_8 = np.clip(_out, 0.0, 255.0).astype(np.uint8)
 
+    # ── Center-column seam brightness blend (unconditional) ───────────
+    # The bright vertical stripe at the geometric center column of the
+    # active exposure region — where the two panoramic halves visually
+    # join — is not always picked up by seam_mask consensus, so the
+    # post-CLAHE seam repair above can leave it untouched. Apply a
+    # 9-column horizontal Gaussian smoothing centered on that column
+    # unconditionally to flatten the brightness transition. sigma=2.0
+    # over a 9-col window gives a soft falloff that suppresses the
+    # bright stripe without smearing anatomy outside the band.
+    seam_col = (_exp_col_lo + _exp_col_hi) // 2
+    if seam_col - 4 >= 0 and seam_col + 5 <= width:
+        from scipy.ndimage import gaussian_filter1d as _gf1d_seam
+        _seam_window = img_8[:, seam_col - 4:seam_col + 5].astype(np.float32)
+        _seam_smoothed = _gf1d_seam(_seam_window, sigma=2.0, axis=1)
+        img_8[:, seam_col - 4:seam_col + 5] = np.clip(
+            _seam_smoothed, 0.0, 255.0,
+        ).astype(np.uint8)
+        log.info("Center-seam blend: 9 cols at col=%d (sigma=2.0)", seam_col)
+
     _dump_stage("06_post_clahe_repair", img_8.astype(np.float32) / 255.0)
 
     # ── Zoom crop — use detected exposure bounds + fade margin ───────
