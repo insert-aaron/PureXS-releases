@@ -2163,8 +2163,8 @@ def reconstruct_image(
     # which was reading PureXS as overall mid-grey in the A/B.
     nz = img_f[img_f > 0]
     if len(nz) > 0:
-        low = np.percentile(nz, 1)
-        high = np.percentile(nz, 97)
+        low = np.percentile(nz, 2)
+        high = np.percentile(nz, 95)
     else:
         low, high = 0.0, 1.0
     if high <= low:
@@ -2699,7 +2699,7 @@ def reconstruct_image(
         # on root anatomy. Single-variable test on top of an otherwise
         # literal 6041ae1 baseline (NLM/aggressive-unsharp/seam-pre-
         # smooth/batch-gain-smooth all reverted out).
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
         img_16 = clahe.apply(img_16)
     except ImportError:
         pass
