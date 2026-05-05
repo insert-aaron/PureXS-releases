@@ -2163,8 +2163,8 @@ def reconstruct_image(
     # which was reading PureXS as overall mid-grey in the A/B.
     nz = img_f[img_f > 0]
     if len(nz) > 0:
-        low = np.percentile(nz, 2)
-        high = np.percentile(nz, 95)
+        low = np.percentile(nz, 3)
+        high = np.percentile(nz, 94)
     else:
         low, high = 0.0, 1.0
     if high <= low:
@@ -2716,7 +2716,7 @@ def reconstruct_image(
     # kept; 3×3 median blur stays out (collapsed trabecular texture).
     try:
         import cv2 as _cv2_bf
-        img_8 = _cv2_bf.bilateralFilter(img_8, d=9, sigmaColor=30, sigmaSpace=10)
+        img_8 = _cv2_bf.bilateralFilter(img_8, d=9, sigmaColor=18, sigmaSpace=18)
     except ImportError:
         pass
 
