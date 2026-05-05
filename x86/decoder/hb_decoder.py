@@ -2720,21 +2720,20 @@ def reconstruct_image(
     except ImportError:
         pass
 
-    # ── Wide dead-row gradient at rows 422-432 (11 rows) ──────────────
+    # ── Wide dead-row gradient at rows 419-435 (17 rows) ──────────────
     # Tightening percentile to p3/p94 + clipLimit=2.5 + tile (8,8)
-    # exposes more local contrast than the prior 5-row stretch could
-    # absorb, so the residual step between the two scan halves
-    # re-appears as a horizontal band across the upper-third (cuts
-    # through maxillary roots and sinus floor — clinically disruptive).
-    # Widen to 11 rows AND use the mean of 5 healthy rows above/below
-    # as anchors instead of single-row values; spreading the brightness
-    # transition over 11 rows with robust anchors makes the step
-    # invisible at p3/p94 contrast.
-    if img_8.shape[0] > 437:
-        _top_anchor = img_8[417:422, :].astype(np.float32).mean(axis=0)
-        _bot_anchor = img_8[433:438, :].astype(np.float32).mean(axis=0)
-        img_8[422:433, :] = np.linspace(
-            _top_anchor, _bot_anchor, 13,
+    # exposes more local contrast than narrower blends could absorb,
+    # so the residual step between the two scan halves re-appears as
+    # a horizontal band across the upper-third. Each widening of the
+    # gradient region (5 → 11 → 17 rows) further spreads the brightness
+    # transition; 17 rows fully eliminates the visible step at the
+    # current p3/p94 contrast. Anchors stay as the mean of 5 healthy
+    # rows above/below the blend region (rows 414-418 and 436-440).
+    if img_8.shape[0] > 440:
+        _top_anchor = img_8[414:419, :].astype(np.float32).mean(axis=0)
+        _bot_anchor = img_8[436:441, :].astype(np.float32).mean(axis=0)
+        img_8[419:436, :] = np.linspace(
+            _top_anchor, _bot_anchor, 19,
         )[1:-1].astype(np.uint8)
 
     # ── Die-junction horizontal seam suppression (post-CLAHE) ─────────
