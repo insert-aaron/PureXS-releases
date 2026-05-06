@@ -31,8 +31,18 @@ log = logging.getLogger("purexs_decoder_cli")
 _CEPH_TYPES = {"Ceph Lateral", "Ceph Frontal"}
 
 
-def process_raw(input_path: Path, output_path: Path, exam_type: str = "Panoramic") -> int:
-    """Read raw scan bytes, decode scanlines, reconstruct, and save PNG."""
+def process_raw(
+    input_path: Path,
+    output_path: Path,
+    exam_type: str = "Panoramic",
+    save_tif: bool = False,
+) -> int:
+    """Read raw scan bytes, decode scanlines, reconstruct, and save PNG.
+
+    When *save_tif* is True, also write an uncompressed 8-bit grayscale TIFF
+    with the same pixel data alongside the PNG (same path, .tif extension).
+    Used by facilities running per-device LUT calibration against Sidexis.
+    """
     raw = input_path.read_bytes()
     if len(raw) < 10_000:
         log.error("Input file too small (%d bytes) — not a valid scan", len(raw))
@@ -71,6 +81,11 @@ def process_raw(input_path: Path, output_path: Path, exam_type: str = "Panoramic
     output_path.parent.mkdir(parents=True, exist_ok=True)
     img.save(str(output_path), "PNG")
     log.info("Saved %dx%d %s to %s", img.width, img.height, exam_type, output_path)
+
+    if save_tif:
+        tif_path = output_path.with_suffix(".tif")
+        img.save(str(tif_path), format="TIFF", compression="none")
+        log.info("Saved TIF (uncompressed) to %s", tif_path)
     return 0
 
 
@@ -93,6 +108,13 @@ def main() -> None:
         help="Exam type for reconstruction pipeline routing",
     )
     parser.add_argument(
+        "--save-tif", action="store_true",
+        help="Also save an uncompressed 8-bit TIFF alongside the PNG "
+             "(same path, .tif extension). Used for per-device Sidexis "
+             "LUT calibration; default off because uncompressed TIFs "
+             "are ~5× the size of PNGs.",
+    )
+    parser.add_argument(
         "--verbose", "-v", action="store_true",
         help="Enable debug logging",
     )
@@ -103,7 +125,7 @@ def main() -> None:
         format="[%(levelname)s] %(message)s",
     )
 
-    sys.exit(process_raw(args.input, args.output, args.exam_type))
+    sys.exit(process_raw(args.input, args.output, args.exam_type, save_tif=args.save_tif))
 
 
 if __name__ == "__main__":
