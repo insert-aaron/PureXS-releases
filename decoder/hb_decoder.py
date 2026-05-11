@@ -1988,13 +1988,45 @@ def reconstruct_image(
     _content_hi = height * 6 // 7
     _col_means = np.mean(img_f[_content_lo:_content_hi, :], axis=0)
     _col_peak = float(np.max(_col_means)) if _col_means.size else 1.0
-    _col_thresh = max(_col_peak * 0.08, 1.0)
+    # Threshold raised 0.08 → 0.12: at 8% the edge of the active-beam
+    # ramp on some scans can sit just above threshold, leaving 50-100
+    # bright cols outside the crop (most visibly the May 11 Facility Y
+    # bug where _exp_col_lo == 0 and the right edge of the displayed
+    # image showed a bright bar).
+    _col_thresh = max(_col_peak * 0.12, 1.0)
     _exp_col_lo = 0
     while _exp_col_lo < width - 1 and _col_means[_exp_col_lo] < _col_thresh:
         _exp_col_lo += 1
     _exp_col_hi = width - 1
     while _exp_col_hi > 0 and _col_means[_exp_col_hi] < _col_thresh:
         _exp_col_hi -= 1
+
+    # Sanity floor: if the walk-in didn't move off col 0 (or col width-1)
+    # the detection failed. The Orthophos has 300+ pre-exposure dark
+    # columns and ~20 post-exposure dark columns, so finding "active"
+    # signal AT the very edge is almost always wrong. Fall back to
+    # known-safe interior offsets unless those edge cols are GENUINELY
+    # dark (< 5% of peak — much darker than the 12% trigger threshold).
+    if _exp_col_lo == 0:
+        leftmost_30 = float(_col_means[:30].mean())
+        if leftmost_30 > _col_peak * 0.05:
+            log.warning(
+                "Exposure bounds: left edge looked active "
+                "(col_means[:30] mean=%.0f vs peak=%.0f, threshold=%.0f) "
+                "— forcing _exp_col_lo=50 fallback to skip pre-exposure dark band",
+                leftmost_30, _col_peak, _col_thresh,
+            )
+            _exp_col_lo = 50
+    if _exp_col_hi == width - 1:
+        rightmost_30 = float(_col_means[-30:].mean())
+        if rightmost_30 > _col_peak * 0.05:
+            log.warning(
+                "Exposure bounds: right edge looked active "
+                "(col_means[-30:] mean=%.0f vs peak=%.0f, threshold=%.0f) "
+                "— forcing _exp_col_hi=width-25 fallback",
+                rightmost_30, _col_peak, _col_thresh,
+            )
+            _exp_col_hi = width - 25
     # Row bounds computed over active columns only so pre-exposure
     # columns don't drag the row mean below threshold near the edges.
     if _exp_col_hi > _exp_col_lo:
