@@ -1890,6 +1890,40 @@ def _pair_heartbeats(capture: DecodedCapture) -> None:
 # ║  Image Reconstruction
 # ╚══════════════════════════════════════════════════════════════════════════════
 
+# A complete Orthophos panoramic sweep delivers ~2700 columns (scanlines).
+# Anything well below that means the device aborted mid-sweep (interlock,
+# X-ray tube fault, network drop, etc.) and reconstruction would stretch a
+# fragment across the full canvas, producing a misleading image. Refuse to
+# reconstruct in that case and tell the operator to retake. 2000 is a safe
+# floor — it accepts the ~2700-column normal scan while rejecting today's
+# 1160-column truncated capture from Facility Y (2026-05-13).
+MIN_PANORAMIC_SCANLINES = 2000
+EXPECTED_PANORAMIC_SCANLINES = 2700
+
+
+def check_scan_completeness(
+    scanlines: list,
+    exam_type: str = "Panoramic",
+) -> tuple[bool, str | None]:
+    """Return (ok, retake_message).
+
+    Ok=False means the caller should NOT reconstruct — instead surface
+    retake_message to the operator. Ceph exams use a different geometry
+    and a different scanline count, so the guard is panoramic-only.
+    """
+    if exam_type != "Panoramic":
+        return True, None
+    n = len(scanlines) if scanlines else 0
+    if n < MIN_PANORAMIC_SCANLINES:
+        msg = (
+            f"Scan incomplete — {n} scanlines received, "
+            f"expected ~{EXPECTED_PANORAMIC_SCANLINES}. "
+            f"The device aborted mid-sweep; please retake the scan."
+        )
+        return False, msg
+    return True, None
+
+
 def reconstruct_image(
     scanlines: list[Scanline],
     invert: bool = True,

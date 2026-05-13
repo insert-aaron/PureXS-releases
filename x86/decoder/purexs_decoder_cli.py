@@ -24,7 +24,14 @@ if str(_SCRIPT_DIR) not in sys.path:
 from hb_decoder import (
     _extract_panoramic, _extract_panoramic_simple,
     reconstruct_image, reconstruct_ceph_image,
+    check_scan_completeness,
 )
+
+# Exit code returned when the scan completed transport but delivered too
+# few scanlines for a valid reconstruction. The WPF wrapper distinguishes
+# this from a generic decoder failure (exit 1) so it can show a clear
+# retake prompt instead of falling through to a useless scanline preview.
+EXIT_INCOMPLETE_SCAN = 2
 
 log = logging.getLogger("purexs_decoder_cli")
 
@@ -66,6 +73,14 @@ def process_raw(
     if not scanlines:
         log.error("Could not extract any scanlines from input")
         return 1
+
+    # Refuse to reconstruct truncated scans — the WPF wrapper looks for the
+    # "INCOMPLETE_SCAN:" prefix to surface a retake message instead of
+    # falling through to a useless scanline preview.
+    ok, retake_msg = check_scan_completeness(scanlines, exam_type)
+    if not ok:
+        log.error("INCOMPLETE_SCAN: %s", retake_msg)
+        return EXIT_INCOMPLETE_SCAN
 
     log.info("Extracted %d scanlines, reconstructing %s...", len(scanlines), exam_type)
 
