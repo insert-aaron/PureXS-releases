@@ -3615,6 +3615,12 @@ class SironaLiveClient:
 
         finally:
             self._sock.settimeout(saved_timeout)
+            # Always clear exposing/armed here.  If the loop above raised a
+            # ConnectionError (device dropped mid-scan), these would otherwise
+            # stay True, causing the next _session_refresh() to early-return
+            # and the next arm to send on a dead socket — a failed rescan.
+            self._exposing_active = False
+            self._armed = False
 
         # ── Save raw buffer for offline analysis ──────────────────────
         log.info(
@@ -3702,8 +3708,7 @@ class SironaLiveClient:
                 self._fire(self.on_event, f"{ev.event_type}: {ev.detail}")
 
         # ── Scan complete — send IMAGE_ACK ────────────────────────────
-        self._exposing_active = False
-        self._armed = False
+        # (exposing/armed already cleared in the finally above)
         log.info("Scan data reception complete — sending IMAGE_ACK")
         self._diag_push(
             f"SCAN_COMPLETE — {len(scanlines)} scanlines, "
