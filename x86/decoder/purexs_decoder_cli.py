@@ -24,7 +24,7 @@ if str(_SCRIPT_DIR) not in sys.path:
 from hb_decoder import (
     _extract_panoramic, _extract_panoramic_simple,
     reconstruct_image, reconstruct_ceph_image,
-    check_scan_completeness,
+    check_scan_completeness, check_detector_geometry,
 )
 
 # Exit code returned when the scan completed transport but delivered too
@@ -32,6 +32,12 @@ from hb_decoder import (
 # this from a generic decoder failure (exit 1) so it can show a clear
 # retake prompt instead of falling through to a useless scanline preview.
 EXIT_INCOMPLETE_SCAN = 2
+
+# Exit code returned when the detector geometry doesn't match the Orthophos XG
+# this pipeline targets (e.g. a fleet unit with a different detector/firmware).
+# Distinct from incomplete (2) so the wrapper shows an "unsupported unit" error
+# rather than a retake prompt — retaking won't help; it's a config/hardware fact.
+EXIT_DETECTOR_MISMATCH = 3
 
 log = logging.getLogger("purexs_decoder_cli")
 
@@ -73,6 +79,14 @@ def process_raw(
     if not scanlines:
         log.error("Could not extract any scanlines from input")
         return 1
+
+    # Hard geometry gate — refuse if the detector isn't the Orthophos XG this
+    # pipeline targets (a different fleet unit/firmware would silently produce
+    # garbage). The WPF wrapper looks for the "DETECTOR_MISMATCH:" prefix.
+    geo_ok, geo_msg = check_detector_geometry(scanlines)
+    if not geo_ok:
+        log.error("DETECTOR_MISMATCH: %s", geo_msg)
+        return EXIT_DETECTOR_MISMATCH
 
     # Refuse to reconstruct truncated scans — the WPF wrapper looks for the
     # "INCOMPLETE_SCAN:" prefix to surface a retake message instead of

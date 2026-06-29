@@ -1924,6 +1924,33 @@ def check_scan_completeness(
     return True, None
 
 
+def check_detector_geometry(scanlines: list) -> tuple[bool, str | None]:
+    """Hard gate: refuse to reconstruct if the detector geometry doesn't match
+    the Orthophos XG / DX41 this pipeline is calibrated for.
+
+    Every reconstruction constant — telemetry-block row positions (~1007),
+    die-junction search (~row 580), frame stride (2632 B = 1316 px) — assumes a
+    PANO_DEFAULT_HEIGHT-row detector. A fleet unit with a different detector or
+    firmware reports a different scanline height and would SILENTLY produce a
+    corrupted image. This makes that case fail loud instead of showing garbage.
+
+    Returns (ok, message). ok=False → do NOT reconstruct; surface message.
+    """
+    if not scanlines:
+        return True, None  # emptiness handled by extraction/completeness checks
+    h = int(scanlines[0].pixel_count)
+    if h != PANO_DEFAULT_HEIGHT:
+        msg = (
+            f"Unsupported detector — scanline height {h}px, expected "
+            f"{PANO_DEFAULT_HEIGHT}px (Orthophos XG/DX41). This unit may be a "
+            f"different model or firmware; the image was NOT reconstructed to "
+            f"avoid showing a corrupted scan. Validate this unit with "
+            f"tools/validate_unit.py before clinical use."
+        )
+        return False, msg
+    return True, None
+
+
 def reconstruct_image(
     scanlines: list[Scanline],
     invert: bool = True,
