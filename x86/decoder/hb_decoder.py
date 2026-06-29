@@ -1928,7 +1928,18 @@ def reconstruct_image(
     scanlines: list[Scanline],
     invert: bool = True,
     repair_mask: np.ndarray | None = None,
+    *,
+    pct_low: float = 2.0,
+    pct_high: float = 95.0,
+    clahe_clip: float = 2.5,
+    clahe_tile: int = 8,
+    unsharp: tuple[tuple[float, int, int], ...] = ((4, 45, 8), (1.5, 75, 5)),
 ) -> Image.Image | None:
+    # Tone/contrast knobs are keyword args with defaults == the production
+    # "HD" tuning, so existing callers are unchanged. They exist so the tone
+    # can be swept against a Sidexis reference (e.g. a softer Sidexis-ward
+    # tune: pct_high=98, clahe_clip=1.5, clahe_tile=32, unsharp=((1,60,3),))
+    # without forking the function. See sidexis_validation_was_circular memory.
     """Reconstruct a panoramic image from decoded scanlines.
 
     Each scanline contributes one column of the panoramic image.  The
@@ -2262,8 +2273,8 @@ def reconstruct_image(
     # which was reading PureXS as overall mid-grey in the A/B.
     nz = img_f[img_f > 0]
     if len(nz) > 0:
-        low = np.percentile(nz, 2)
-        high = np.percentile(nz, 95)
+        low = np.percentile(nz, pct_low)
+        high = np.percentile(nz, pct_high)
     else:
         low, high = 0.0, 1.0
     if high <= low:
@@ -2798,7 +2809,8 @@ def reconstruct_image(
         # on root anatomy. Single-variable test on top of an otherwise
         # literal 6041ae1 baseline (NLM/aggressive-unsharp/seam-pre-
         # smooth/batch-gain-smooth all reverted out).
-        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+        clahe = cv2.createCLAHE(clipLimit=clahe_clip,
+                                tileGridSize=(clahe_tile, clahe_tile))
         img_16 = clahe.apply(img_16)
     except ImportError:
         pass
@@ -3005,12 +3017,11 @@ def reconstruct_image(
     # the visible work.
     try:
         from PIL import ImageFilter
-        img_pil = img_pil.filter(
-            ImageFilter.UnsharpMask(radius=4, percent=45, threshold=8)
-        )
-        img_pil = img_pil.filter(
-            ImageFilter.UnsharpMask(radius=1.5, percent=75, threshold=5)
-        )
+        for _radius, _percent, _threshold in unsharp:
+            img_pil = img_pil.filter(
+                ImageFilter.UnsharpMask(radius=_radius, percent=_percent,
+                                        threshold=_threshold)
+            )
     except Exception:
         pass
 
