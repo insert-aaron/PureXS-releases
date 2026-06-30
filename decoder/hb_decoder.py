@@ -1662,6 +1662,12 @@ def _extract_panoramic(data: bytes, detector_height: int = 0) -> tuple[list[Scan
     # forcing a retake (which would re-expose the patient).
     _remainder = (len(clean) // 2) % img_height
     _phase_err = min(_remainder, img_height - _remainder)
+    # Telemetry — record on EVERY scan so misalignment frequency can be tracked
+    # per unit (the host pairs this with the scan's unit_id in sessions.json).
+    global LAST_PHASE_ERR
+    LAST_PHASE_ERR = int(_phase_err)
+    log.info("Column phase error: %d px (remainder=%d)", _phase_err, _remainder)
+    print(f"PHASE_ERR={_phase_err}", file=sys.stderr)
     if _phase_err > RESHAPE_MAX_PHASE_ERR:
         if AUTO_RECOVER_MISALIGNED:
             log.warning("Column phase off by %d px (remainder=%d) — "
@@ -1949,6 +1955,11 @@ RESHAPE_MAX_PHASE_ERR = 32
 #       deterministic and verified, but recovers from misaligned data — only
 #       enable if a facility prefers salvage over a guaranteed-clean retake.
 AUTO_RECOVER_MISALIGNED = False
+
+# Column-phase error (px) from the most recent _extract_panoramic call. Set on
+# EVERY scan for misalignment-frequency telemetry. In-process callers (Python
+# GUI) read this directly; the WPF host parses "PHASE_ERR=" from decoder stderr.
+LAST_PHASE_ERR = 0
 
 
 class ReshapeMisalignedError(Exception):
