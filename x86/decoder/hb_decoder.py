@@ -1918,25 +1918,13 @@ def _pair_heartbeats(capture: DecodedCapture) -> None:
 MIN_PANORAMIC_SCANLINES = 2000
 EXPECTED_PANORAMIC_SCANLINES = 2700
 
-# Max tolerated column-phase error (pixels) before the reshape is considered
-# misaligned. A correctly de-stuffed stream ends within ~1-5 px of a column
-# boundary; phase error is min(remainder, height-remainder). A large value
-# (e.g. 747 on a 1316-row detector) means an off-phase pixel_start rolled every
-# column vertically, FOLDING the image into a tiled/wrapped mess.
-RESHAPE_MAX_PHASE_ERR = 32
-
-# Policy for a column-phase-misaligned scan (clinical-risk choice):
-#   False (STRICT, default) → reject: raise ReshapeMisalignedError so the
-#       operator retakes. A reconstructed-from-misaligned image is NEVER shown.
-#   True  (RECOVER)         → auto-correct: roll the columns back into phase and
-#       reconstruct normally (no retake / no re-exposure). The correction is
-#       deterministic and verified, but recovers from misaligned data — only
-#       enable if a facility prefers salvage over a guaranteed-clean retake.
-AUTO_RECOVER_MISALIGNED = False
-
 # Column-phase error (px) from the most recent _extract_panoramic call. Set on
 # EVERY scan for misalignment-frequency telemetry. In-process callers (Python
 # GUI) read this directly; the WPF host parses "PHASE_ERR=" from decoder stderr.
+# phase_err = min(remainder, height-remainder); ~1-5 is healthy, a large value
+# (e.g. 747 on a 1316-row detector) flags an off-phase stream that can fold the
+# panoramic. It is TELEMETRY ONLY — never a reject (a large remainder alone does
+# NOT reliably indicate a fold; a real fold is visually obvious and retaken).
 LAST_PHASE_ERR = 0
 
 # Sharpness below which a scan is flagged as likely blurry (a NON-blocking
@@ -1956,22 +1944,6 @@ def image_sharpness(img) -> float:
         return float(cv2.Laplacian(arr, cv2.CV_32F).var())
     except Exception:
         return 0.0
-
-
-class ReshapeMisalignedError(Exception):
-    """Raised when the pixel stream's column phase is broken, so reshaping
-    would fold the panoramic into a tiled/wrapped image. Carries the measured
-    phase error so callers can surface a clear 'retake' message."""
-
-    def __init__(self, phase_err: int, height: int) -> None:
-        self.phase_err = phase_err
-        self.height = height
-        super().__init__(
-            f"Scan data misaligned — column phase off by {phase_err}px "
-            f"(detector {height}px). The pixel-stream start landed off the "
-            f"column boundary; reconstructing would fold the image. "
-            f"Please retake the scan."
-        )
 
 
 def check_scan_completeness(
@@ -3765,28 +3737,19 @@ class SironaLiveClient:
 
         # Extract full panoramic image from continuous pixel stream
         # Try advanced panoramic extraction (with telemetry repair etc.)
-        self._scan_misaligned = False
         try:
             _pano_result = _extract_panoramic(raw)
             if isinstance(_pano_result, tuple):
                 scanlines, self._repair_mask = _pano_result
             else:
                 scanlines, self._repair_mask = _pano_result, None
-        except ReshapeMisalignedError as exc:
-            # Column phase broken — both extractors would fold. Flag it and do
-            # NOT fall back to simple (which would also fold); the GUI surfaces
-            # a retake instead of showing a tiled scan.
-            log.error("Panoramic extraction misaligned: %s", exc)
-            self._scan_misaligned = True
-            scanlines = []
-            self._repair_mask = None
         except Exception as exc:
             log.error("Advanced panoramic extraction failed: %s", exc)
             scanlines = []
             self._repair_mask = None
 
         # Fallback 1: simple panoramic extraction (no telemetry repair)
-        if not scanlines and not self._scan_misaligned:
+        if not scanlines:
             try:
                 scanlines = _extract_panoramic_simple(raw)
                 self._repair_mask = None

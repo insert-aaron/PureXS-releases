@@ -25,7 +25,6 @@ from hb_decoder import (
     _extract_panoramic, _extract_panoramic_simple,
     reconstruct_image, reconstruct_ceph_image,
     check_scan_completeness, check_detector_geometry,
-    ReshapeMisalignedError,
     image_sharpness, SHARPNESS_WARN_THRESHOLD,
 )
 
@@ -40,13 +39,6 @@ EXIT_INCOMPLETE_SCAN = 2
 # Distinct from incomplete (2) so the wrapper shows an "unsupported unit" error
 # rather than a retake prompt — retaking won't help; it's a config/hardware fact.
 EXIT_DETECTOR_MISMATCH = 3
-
-# Exit code returned when the pixel stream's column phase is broken (a
-# telemetry/echo block was mis-stripped) so reshaping would FOLD the panoramic
-# into a tiled/wrapped image. Retakeable (it's transient per-scan corruption),
-# so the wrapper surfaces a retake prompt and suppresses the scanline fallback
-# (which would fold too). Stderr prefix: "MISALIGNED_SCAN:".
-EXIT_MISALIGNED_SCAN = 4
 
 log = logging.getLogger("purexs_decoder_cli")
 
@@ -79,11 +71,6 @@ def process_raw(
             scanlines, repair_mask = result
         else:
             scanlines = result
-    except ReshapeMisalignedError as exc:
-        # Column phase is broken — reshaping (advanced OR simple) would fold the
-        # image. Refuse loudly instead of falling back to a tiled scan.
-        log.error("MISALIGNED_SCAN: %s", exc)
-        return EXIT_MISALIGNED_SCAN
     except Exception as exc:
         log.warning("Advanced extraction failed (%s), trying simple fallback", exc)
 
