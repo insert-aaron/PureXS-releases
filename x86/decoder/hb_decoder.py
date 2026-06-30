@@ -1652,6 +1652,26 @@ def _extract_panoramic(data: bytes, detector_height: int = 0) -> tuple[list[Scan
             print(f"  contamination[{ci}] @{cpos}: {bytes(clean[start:end]).hex()}")
     # ── END RESHAPE INTEGRITY CHECK ──────────────────────────────────
 
+    # ── Column-phase misalignment check ─────────────────────────────────
+    # Phase error = distance to the nearest column boundary. ≈0 (clean end) or
+    # ≈height (1-px-short last column) are both fine. A MID-RANGE remainder
+    # (e.g. 747 on a 1316-row detector) means an off-phase pixel_start rolled
+    # every column vertically, folding the image. This is RECOVERABLE — the
+    # column-phase correction after reshape (below) rolls it back. We only log
+    # it here for telemetry; the correction salvages the scan rather than
+    # forcing a retake (which would re-expose the patient).
+    _remainder = (len(clean) // 2) % img_height
+    _phase_err = min(_remainder, img_height - _remainder)
+    if _phase_err > RESHAPE_MAX_PHASE_ERR:
+        if AUTO_RECOVER_MISALIGNED:
+            log.warning("Column phase off by %d px (remainder=%d) — "
+                        "auto-correcting after reshape", _phase_err, _remainder)
+        else:
+            # STRICT: never reconstruct from misaligned data — operator retakes.
+            log.error("Column phase off by %d px (remainder=%d) — refusing to "
+                      "fold (strict mode)", _phase_err, _remainder)
+            raise ReshapeMisalignedError(_phase_err, img_height)
+
     # Trim tail to nearest column boundary if remainder exists
     # (echo detection inaccuracies can leave a small residual)
     remainder_px = (len(clean) // 2) % img_height
@@ -1675,6 +1695,20 @@ def _extract_panoramic(data: bytes, detector_height: int = 0) -> tuple[list[Scan
     width = len(clean) // 2 // img_height
     arr = np.frombuffer(clean, dtype='>u2')
     img_array = arr.reshape(width, img_height)
+
+    # ── Column-phase correction (RECOVER mode only) ─────────────────────
+    # An off-phase pixel_start (the correlation search doesn't pin the column
+    # boundary) rolls every column vertically by a constant offset = the
+    # leftover `remainder`, folding the image. Rolling back by
+    # (height - remainder) re-aligns. No-op for aligned scans (remainder ≈ 0).
+    # Skipped in STRICT mode — there, a misaligned scan already raised above, so
+    # only aligned scans reach here and need no correction.
+    if AUTO_RECOVER_MISALIGNED:
+        _phase_roll = (img_height - remainder_px) % img_height
+        if _phase_roll:
+            img_array = np.roll(img_array, _phase_roll, axis=1)
+            log.info("Column-phase correction: rolled %d px (remainder was %d)",
+                     _phase_roll, remainder_px)
 
     img_width = width
     log.info("Reshape: %d × %d (remainder=0 confirmed)", img_height, width)
@@ -1899,6 +1933,38 @@ def _pair_heartbeats(capture: DecodedCapture) -> None:
 # 1160-column truncated capture from Facility Y (2026-05-13).
 MIN_PANORAMIC_SCANLINES = 2000
 EXPECTED_PANORAMIC_SCANLINES = 2700
+
+# Max tolerated column-phase error (pixels) before the reshape is considered
+# misaligned. A correctly de-stuffed stream ends within ~1-5 px of a column
+# boundary; phase error is min(remainder, height-remainder). A large value
+# (e.g. 747 on a 1316-row detector) means an off-phase pixel_start rolled every
+# column vertically, FOLDING the image into a tiled/wrapped mess.
+RESHAPE_MAX_PHASE_ERR = 32
+
+# Policy for a column-phase-misaligned scan (clinical-risk choice):
+#   False (STRICT, default) → reject: raise ReshapeMisalignedError so the
+#       operator retakes. A reconstructed-from-misaligned image is NEVER shown.
+#   True  (RECOVER)         → auto-correct: roll the columns back into phase and
+#       reconstruct normally (no retake / no re-exposure). The correction is
+#       deterministic and verified, but recovers from misaligned data — only
+#       enable if a facility prefers salvage over a guaranteed-clean retake.
+AUTO_RECOVER_MISALIGNED = False
+
+
+class ReshapeMisalignedError(Exception):
+    """Raised when the pixel stream's column phase is broken, so reshaping
+    would fold the panoramic into a tiled/wrapped image. Carries the measured
+    phase error so callers can surface a clear 'retake' message."""
+
+    def __init__(self, phase_err: int, height: int) -> None:
+        self.phase_err = phase_err
+        self.height = height
+        super().__init__(
+            f"Scan data misaligned — column phase off by {phase_err}px "
+            f"(detector {height}px). The pixel-stream start landed off the "
+            f"column boundary; reconstructing would fold the image. "
+            f"Please retake the scan."
+        )
 
 
 def check_scan_completeness(
@@ -3692,19 +3758,28 @@ class SironaLiveClient:
 
         # Extract full panoramic image from continuous pixel stream
         # Try advanced panoramic extraction (with telemetry repair etc.)
+        self._scan_misaligned = False
         try:
             _pano_result = _extract_panoramic(raw)
             if isinstance(_pano_result, tuple):
                 scanlines, self._repair_mask = _pano_result
             else:
                 scanlines, self._repair_mask = _pano_result, None
+        except ReshapeMisalignedError as exc:
+            # Column phase broken — both extractors would fold. Flag it and do
+            # NOT fall back to simple (which would also fold); the GUI surfaces
+            # a retake instead of showing a tiled scan.
+            log.error("Panoramic extraction misaligned: %s", exc)
+            self._scan_misaligned = True
+            scanlines = []
+            self._repair_mask = None
         except Exception as exc:
             log.error("Advanced panoramic extraction failed: %s", exc)
             scanlines = []
             self._repair_mask = None
 
         # Fallback 1: simple panoramic extraction (no telemetry repair)
-        if not scanlines:
+        if not scanlines and not self._scan_misaligned:
             try:
                 scanlines = _extract_panoramic_simple(raw)
                 self._repair_mask = None
