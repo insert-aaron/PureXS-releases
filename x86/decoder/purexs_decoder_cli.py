@@ -26,6 +26,7 @@ from hb_decoder import (
     reconstruct_image, reconstruct_ceph_image,
     check_scan_completeness, check_detector_geometry,
     ReshapeMisalignedError,
+    image_sharpness, SHARPNESS_WARN_THRESHOLD,
 )
 
 # Exit code returned when the scan completed transport but delivered too
@@ -122,6 +123,13 @@ def process_raw(
     if img is None:
         log.error("Reconstruction returned None")
         return 1
+
+    # Sharpness advisory (NON-blocking) — low = likely blurry (patient motion /
+    # positioning). The WPF host parses SHARPNESS/BLURRY to toast a "review /
+    # consider retake" note. Never rejects the scan.
+    _sharp = image_sharpness(img)
+    print(f"SHARPNESS={_sharp:.1f}", file=sys.stderr)
+    print(f"BLURRY={1 if _sharp < SHARPNESS_WARN_THRESHOLD else 0}", file=sys.stderr)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     img.save(str(output_path), "PNG")

@@ -1652,31 +1652,23 @@ def _extract_panoramic(data: bytes, detector_height: int = 0) -> tuple[list[Scan
             print(f"  contamination[{ci}] @{cpos}: {bytes(clean[start:end]).hex()}")
     # ── END RESHAPE INTEGRITY CHECK ──────────────────────────────────
 
-    # ── Column-phase misalignment check ─────────────────────────────────
-    # Phase error = distance to the nearest column boundary. ≈0 (clean end) or
-    # ≈height (1-px-short last column) are both fine. A MID-RANGE remainder
-    # (e.g. 747 on a 1316-row detector) means an off-phase pixel_start rolled
-    # every column vertically, folding the image. This is RECOVERABLE — the
-    # column-phase correction after reshape (below) rolls it back. We only log
-    # it here for telemetry; the correction salvages the scan rather than
-    # forcing a retake (which would re-expose the patient).
+    # ── Column-phase telemetry (NOT a fold gate) ────────────────────────
+    # Phase error = distance to the nearest column boundary.
+    # IMPORTANT: this is logged for telemetry ONLY — it is NOT a reliable fold
+    # detector and must NOT gate/correct reconstruction. A coherent scan can
+    # have a large remainder (scan_20260628_180207 = 283 → reconstructs
+    # perfectly) exactly like a genuinely-folded one (scan_2_broken = 569).
+    # Remainder alone cannot distinguish a benign tail-partial from a head-phase
+    # fold, so rejecting/rolling on it both false-rejects and corrupts good
+    # scans. A real fold detector (interior wrap-discontinuity) is the proper
+    # future fix; until then we only record phase_err so its distribution can be
+    # studied per unit (paired with unit_id in sessions.json).
     _remainder = (len(clean) // 2) % img_height
     _phase_err = min(_remainder, img_height - _remainder)
-    # Telemetry — record on EVERY scan so misalignment frequency can be tracked
-    # per unit (the host pairs this with the scan's unit_id in sessions.json).
     global LAST_PHASE_ERR
     LAST_PHASE_ERR = int(_phase_err)
     log.info("Column phase error: %d px (remainder=%d)", _phase_err, _remainder)
     print(f"PHASE_ERR={_phase_err}", file=sys.stderr)
-    if _phase_err > RESHAPE_MAX_PHASE_ERR:
-        if AUTO_RECOVER_MISALIGNED:
-            log.warning("Column phase off by %d px (remainder=%d) — "
-                        "auto-correcting after reshape", _phase_err, _remainder)
-        else:
-            # STRICT: never reconstruct from misaligned data — operator retakes.
-            log.error("Column phase off by %d px (remainder=%d) — refusing to "
-                      "fold (strict mode)", _phase_err, _remainder)
-            raise ReshapeMisalignedError(_phase_err, img_height)
 
     # Trim tail to nearest column boundary if remainder exists
     # (echo detection inaccuracies can leave a small residual)
@@ -1701,20 +1693,6 @@ def _extract_panoramic(data: bytes, detector_height: int = 0) -> tuple[list[Scan
     width = len(clean) // 2 // img_height
     arr = np.frombuffer(clean, dtype='>u2')
     img_array = arr.reshape(width, img_height)
-
-    # ── Column-phase correction (RECOVER mode only) ─────────────────────
-    # An off-phase pixel_start (the correlation search doesn't pin the column
-    # boundary) rolls every column vertically by a constant offset = the
-    # leftover `remainder`, folding the image. Rolling back by
-    # (height - remainder) re-aligns. No-op for aligned scans (remainder ≈ 0).
-    # Skipped in STRICT mode — there, a misaligned scan already raised above, so
-    # only aligned scans reach here and need no correction.
-    if AUTO_RECOVER_MISALIGNED:
-        _phase_roll = (img_height - remainder_px) % img_height
-        if _phase_roll:
-            img_array = np.roll(img_array, _phase_roll, axis=1)
-            log.info("Column-phase correction: rolled %d px (remainder was %d)",
-                     _phase_roll, remainder_px)
 
     img_width = width
     log.info("Reshape: %d × %d (remainder=0 confirmed)", img_height, width)
@@ -1960,6 +1938,24 @@ AUTO_RECOVER_MISALIGNED = False
 # EVERY scan for misalignment-frequency telemetry. In-process callers (Python
 # GUI) read this directly; the WPF host parses "PHASE_ERR=" from decoder stderr.
 LAST_PHASE_ERR = 0
+
+# Sharpness below which a scan is flagged as likely blurry (a NON-blocking
+# advisory — "review / consider retake", never a reject). Metric = variance of
+# the Laplacian of the final image. Measured: sharp scans ≈ 69-140, a
+# motion-blurred scan ≈ 32; 45 separates them with margin. Blur is usually
+# patient motion/positioning, not a software fault, so we only advise.
+SHARPNESS_WARN_THRESHOLD = 45.0
+
+
+def image_sharpness(img) -> float:
+    """Variance of the Laplacian of a PIL image — a standard focus/blur metric.
+    Higher = sharper. Returns 0.0 if OpenCV is unavailable."""
+    try:
+        import cv2
+        arr = np.asarray(img.convert("L"), dtype=np.float32)
+        return float(cv2.Laplacian(arr, cv2.CV_32F).var())
+    except Exception:
+        return 0.0
 
 
 class ReshapeMisalignedError(Exception):
