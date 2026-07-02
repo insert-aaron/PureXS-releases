@@ -2002,6 +2002,74 @@ def analyze_blur(img):
     return overall, True, "motion", BLUR_HINT_MOTION
 
 
+def analyze_positioning(img) -> dict:
+    """Geometric patient-positioning proxies from the reconstructed panoramic.
+
+    SILENT / telemetry-only (Phase 1): these raw, resolution-independent numbers
+    are logged per scan so thresholds can be calibrated from real fleet data
+    BEFORE any operator-facing advisory is turned on. No classification or hint
+    is produced here — that comes once the distribution is known.
+
+    All metrics are dimensionless (x normalized to image width, y to height):
+      occ_curvature  : 2nd-order coeff of the inter-arch occlusal band. A well-
+                       positioned pano curves into a smile; a flat/inverted value
+                       suggests a chin-tilt error (head extended/flexed).
+      occ_tilt       : 1st-order slope of the occlusal band → head cant/rotation
+                       (~0 = level).
+      lr_symmetry    : normalized correlation of the left half vs the mirrored
+                       right half (1 = symmetric; lower = head rotation).
+      midline_offset : horizontal offset of the occlusal low-point (anterior
+                       midline) from image center, as a fraction of width
+                       (0 = centered, + = shifted right).
+
+    Returns all-zero metrics if the image can't be analyzed.
+    """
+    zero = {"occ_curvature": 0.0, "occ_tilt": 0.0,
+            "lr_symmetry": 0.0, "midline_offset": 0.0}
+    try:
+        a = np.asarray(img.convert("L"), dtype=np.float32)
+        h, w = a.shape
+        if h < 20 or w < 40:
+            return zero
+
+        # Track the inter-arch dark band (occlusal air gap) per column, within
+        # the middle vertical third where it lives.
+        top, bot = h // 4, 3 * h // 4
+        occ = (a[top:bot].argmin(axis=0) + top).astype(np.float32)
+
+        # Median-smooth to reject spurious dark features (sinus/air pockets).
+        k = max(5, (w // 100) | 1)
+        pad = k // 2
+        occ_s = occ.copy()
+        for i in range(pad, w - pad):
+            occ_s[i] = np.median(occ[i - pad:i + pad + 1])
+
+        xs = np.arange(w, dtype=np.float32)
+        m = (xs > w * 0.1) & (xs < w * 0.9)
+        xn = xs[m] / w
+        yn = occ_s[m] / h
+        c2 = np.polyfit(xn, yn, 2)   # yn = c2[0]*xn^2 + c2[1]*xn + c2[2]
+        c1 = np.polyfit(xn, yn, 1)
+        curvature = float(c2[0])
+        tilt = float(c1[0])
+        vertex_x = -c2[1] / (2 * c2[0]) if abs(c2[0]) > 1e-9 else 0.5
+        midline_offset = float(vertex_x - 0.5)
+
+        half = w // 2
+        L = a[:, :half]
+        R = np.fliplr(a[:, w - half:])
+        Ln = (L - L.mean()) / (L.std() + 1e-6)
+        Rn = (R - R.mean()) / (R.std() + 1e-6)
+        sym = float((Ln * Rn).mean())
+
+        return {"occ_curvature": round(curvature, 4),
+                "occ_tilt": round(tilt, 4),
+                "lr_symmetry": round(sym, 3),
+                "midline_offset": round(midline_offset, 4)}
+    except Exception:
+        return zero
+
+
 def check_scan_completeness(
     scanlines: list,
     exam_type: str = "Panoramic",

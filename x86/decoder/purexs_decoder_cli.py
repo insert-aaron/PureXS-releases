@@ -25,7 +25,7 @@ from hb_decoder import (
     _extract_panoramic, _extract_panoramic_simple,
     reconstruct_image, reconstruct_ceph_image,
     check_scan_completeness, check_detector_geometry,
-    analyze_blur, SHARPNESS_WARN_THRESHOLD,
+    analyze_blur, analyze_positioning, SHARPNESS_WARN_THRESHOLD,
 )
 
 # Exit code returned when the scan completed transport but delivered too
@@ -120,6 +120,14 @@ def process_raw(
     print(f"SHARPNESS={_sharp:.1f}", file=sys.stderr)
     print(f"BLURRY={1 if _blurry else 0}", file=sys.stderr)
     print(f"BLUR_PATTERN={_pattern}", file=sys.stderr)
+
+    # Patient-positioning proxies (SILENT — telemetry only, no operator hint yet;
+    # thresholds get calibrated from fleet data before any advisory turns on).
+    _pos = analyze_positioning(img)
+    print(f"POS_CURV={_pos['occ_curvature']:.4f}", file=sys.stderr)
+    print(f"POS_TILT={_pos['occ_tilt']:.4f}", file=sys.stderr)
+    print(f"POS_SYM={_pos['lr_symmetry']:.3f}", file=sys.stderr)
+    print(f"POS_MID={_pos['midline_offset']:.4f}", file=sys.stderr)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     img.save(str(output_path), "PNG")
