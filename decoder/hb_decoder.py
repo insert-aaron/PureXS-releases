@@ -3619,6 +3619,13 @@ class SironaLiveClient:
 
         We accumulate all bytes into a single buffer, then parse kV
         samples and scanlines from the complete buffer.
+
+        NOTE: we intentionally do NOT scan the pixel stream for the
+        E7 14 02 (ERR_SIDEXIS_API) post-scan marker mid-sweep. A raw
+        3-byte match can collide with pixel data and truncate a good
+        scan; the 2s idle timeout is the sole end-of-sweep signal here.
+        (The WPF client was aligned to this behavior — see SironaService
+        ReaderLoopAsync.)
         """
         if self._sock is None:
             return

@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: pillow
-Version: 12.2.0
+Version: 12.3.0
 Summary: Python Imaging Library (fork)
 Author-email: Jeffrey 'Alex' Clark <aclark@aclark.net>
 License-Expression: MIT-CMU
@@ -48,17 +48,16 @@ Requires-Dist: arro3-core; extra == "test-arrow"
 Requires-Dist: nanoarrow; extra == "test-arrow"
 Requires-Dist: pyarrow; extra == "test-arrow"
 Provides-Extra: tests
-Requires-Dist: check-manifest; extra == "tests"
 Requires-Dist: coverage>=7.4.2; extra == "tests"
 Requires-Dist: defusedxml; extra == "tests"
 Requires-Dist: markdown2; extra == "tests"
 Requires-Dist: olefile; extra == "tests"
 Requires-Dist: packaging; extra == "tests"
-Requires-Dist: pyroma>=5; extra == "tests"
 Requires-Dist: pytest; extra == "tests"
 Requires-Dist: pytest-cov; extra == "tests"
 Requires-Dist: pytest-timeout; extra == "tests"
 Requires-Dist: pytest-xdist; extra == "tests"
+Requires-Dist: setuptools; extra == "tests"
 Requires-Dist: trove-classifiers>=2024.10.12; extra == "tests"
 Provides-Extra: xmp
 Requires-Dist: defusedxml; extra == "xmp"
@@ -75,8 +74,10 @@ Dynamic: license-file
 Pillow is the friendly PIL fork by [Jeffrey 'Alex' Clark and
 contributors](https://github.com/python-pillow/Pillow/graphs/contributors).
 PIL is the Python Imaging Library by Fredrik Lundh and contributors.
-As of 2019, Pillow development is
-[supported by Tidelift](https://tidelift.com/subscription/pkg/pypi-pillow?utm_source=pypi-pillow&utm_medium=readme&utm_campaign=enterprise).
+Development is supported by:
+- [Tidelift](https://tidelift.com/subscription/pkg/pypi-pillow?utm_source=pypi-pillow&utm_medium=readme&utm_campaign=enterprise) (since 2018)
+- [Thanks.dev](https://thanks.dev) (since 2023)
+- [GitHub Sponsors](https://github.com/sponsors/python-pillow) (since 2026)
 
 <table>
     <tr>
@@ -172,4 +173,8 @@ The core image library is designed for fast access to data stored in a few basic
 
 ## Report a vulnerability
 
-To report a security vulnerability, please follow the procedure described in the [Tidelift security policy](https://tidelift.com/docs/security).
+To report sensitive vulnerability information, report it [privately on GitHub](https://github.com/python-pillow/Pillow/security/advisories/new).
+
+If you cannot use GitHub, use the [Tidelift security contact](https://tidelift.com/security). Tidelift will coordinate the fix and disclosure.
+
+DO NOT report sensitive vulnerability information in public.
