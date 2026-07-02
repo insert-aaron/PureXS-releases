@@ -1946,6 +1946,62 @@ def image_sharpness(img) -> float:
         return 0.0
 
 
+# Operator hints for the two blur patterns (see analyze_blur). Kept here so the
+# in-process Python GUI and the WPF host (which maps the BLUR_PATTERN token to
+# its own copy of these strings) stay in agreement.
+BLUR_HINT_POSITIONING = (
+    "Front teeth look blurry — check patient positioning and bite-peg "
+    "placement (the anterior is out of the focal trough). Consider a retake."
+)
+BLUR_HINT_MOTION = (
+    "Scan looks blurry across the arch — likely patient movement during the "
+    "sweep. Keep the patient still and consider a retake."
+)
+
+
+def analyze_blur(img):
+    """Classify blur on the final panoramic into a per-scan operator hint.
+
+    Returns ``(sharpness, blurry, pattern, hint)``:
+      * ``sharpness`` – variance-of-Laplacian over the whole image (higher =
+        sharper); same metric/threshold as :func:`image_sharpness`.
+      * ``blurry``    – ``sharpness < SHARPNESS_WARN_THRESHOLD``.
+      * ``pattern``   – ``"sharp"`` | ``"positioning"`` | ``"motion"``.
+      * ``hint``      – operator guidance (``""`` when sharp).
+
+    A panoramic is acquired column-by-column across time, so the image width is
+    the arch: the CENTER columns are the anterior (front teeth), the LEFT/RIGHT
+    edges are the posterior (molars/rami). When a scan is blurry we compare the
+    two: if the anterior is markedly softer than the posterior, the front teeth
+    fell out of the (narrow) anterior focal trough — the classic positioning /
+    bite-peg error → ``"positioning"``. If the blur is spread roughly evenly
+    across the arch instead, it's patient movement → ``"motion"``.
+    """
+    try:
+        import cv2
+        arr = np.asarray(img.convert("L"), dtype=np.float32)
+        lap = cv2.Laplacian(arr, cv2.CV_32F)
+    except Exception:
+        return 0.0, False, "sharp", ""
+
+    overall = float(lap.var())
+    if overall >= SHARPNESS_WARN_THRESHOLD:
+        return overall, False, "sharp", ""
+
+    w = lap.shape[1]
+    if w < 12:  # too narrow to band — default to the motion advisory
+        return overall, True, "motion", BLUR_HINT_MOTION
+
+    nb = 6
+    bands = [float(lap[:, i * w // nb:(i + 1) * w // nb].var()) for i in range(nb)]
+    center = (bands[2] + bands[3]) / 2.0     # anterior (front teeth)
+    edges = (bands[0] + bands[nb - 1]) / 2.0  # posterior (molars / rami)
+    # Anterior clearly softer than posterior → focal-trough / positioning error.
+    if edges > 0 and center < 0.6 * edges:
+        return overall, True, "positioning", BLUR_HINT_POSITIONING
+    return overall, True, "motion", BLUR_HINT_MOTION
+
+
 def check_scan_completeness(
     scanlines: list,
     exam_type: str = "Panoramic",

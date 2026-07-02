@@ -25,7 +25,7 @@ from hb_decoder import (
     _extract_panoramic, _extract_panoramic_simple,
     reconstruct_image, reconstruct_ceph_image,
     check_scan_completeness, check_detector_geometry,
-    image_sharpness, SHARPNESS_WARN_THRESHOLD,
+    analyze_blur, SHARPNESS_WARN_THRESHOLD,
 )
 
 # Exit code returned when the scan completed transport but delivered too
@@ -111,12 +111,15 @@ def process_raw(
         log.error("Reconstruction returned None")
         return 1
 
-    # Sharpness advisory (NON-blocking) — low = likely blurry (patient motion /
-    # positioning). The WPF host parses SHARPNESS/BLURRY to toast a "review /
-    # consider retake" note. Never rejects the scan.
-    _sharp = image_sharpness(img)
+    # Sharpness advisory (NON-blocking) — low = likely blurry. analyze_blur also
+    # classifies WHERE the blur is: "positioning" (anterior/front-teeth out of
+    # the focal trough → check bite peg) vs "motion" (uniform → patient moved).
+    # The WPF host parses SHARPNESS/BLURRY/BLUR_PATTERN to toast a targeted
+    # "review / consider retake" hint. Never rejects the scan.
+    _sharp, _blurry, _pattern, _hint = analyze_blur(img)
     print(f"SHARPNESS={_sharp:.1f}", file=sys.stderr)
-    print(f"BLURRY={1 if _sharp < SHARPNESS_WARN_THRESHOLD else 0}", file=sys.stderr)
+    print(f"BLURRY={1 if _blurry else 0}", file=sys.stderr)
+    print(f"BLUR_PATTERN={_pattern}", file=sys.stderr)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     img.save(str(output_path), "PNG")
