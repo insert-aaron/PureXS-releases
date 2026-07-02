@@ -1961,9 +1961,10 @@ def check_scan_completeness(
     n = len(scanlines) if scanlines else 0
     if n < MIN_PANORAMIC_SCANLINES:
         msg = (
-            f"Scan incomplete — {n} scanlines received, "
-            f"expected ~{EXPECTED_PANORAMIC_SCANLINES}. "
-            f"The device aborted mid-sweep; please retake the scan."
+            f"Scan ended early — {n} of ~{EXPECTED_PANORAMIC_SCANLINES} "
+            f"columns captured. This usually means the EXPOSE button was "
+            f"released before the sweep finished. Keep holding the button "
+            f"down until the unit stops moving, then retake the scan."
         )
         return False, msg
     return True, None
