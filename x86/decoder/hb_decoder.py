@@ -2002,6 +2002,46 @@ def analyze_blur(img):
     return overall, True, "motion", BLUR_HINT_MOTION
 
 
+# Column-phase error (px) above which a RECONSTRUCTED scan is unusual enough to
+# be worth keeping for fold-detector calibration. NOT a reject and NOT a fold
+# verdict — clean scans are ~1-5 px; both 180207 (283, good) and scan_2_broken
+# (569, folded) exceed this, and we deliberately want BOTH as labeled samples
+# (a real fold and a benign high-phase_err good scan). Data collection only.
+SUSPECTED_FOLD_PHASE_ERR = 40
+
+
+def preserve_suspected_fold(src_path, phase_err, dest_dir, unit_id="", keep=20):
+    """Silently keep a copy of a reconstructed-but-off-phase scan's raw bytes so
+    real folds can be gathered for a future, properly-validated fold detector.
+
+    This NEVER gates, alters, or blocks the displayed/uploaded image — it only
+    copies the raw ``.bin`` aside (temp folders rotate, so otherwise a fold is
+    lost before anyone can grab it). Trims to the most recent ``keep`` files.
+    Best-effort; returns the saved path or None.
+    """
+    try:
+        import shutil
+        src = Path(src_path)
+        if not src.exists():
+            return None
+        d = Path(dest_dir)
+        d.mkdir(parents=True, exist_ok=True)
+        ts = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+        safe_unit = "".join(c for c in (unit_id or "unit") if c.isalnum() or c in "-_") or "unit"
+        dst = d / f"fold_{safe_unit}_{ts}_pe{int(phase_err)}.bin"
+        shutil.copyfile(src, dst)
+        for old in sorted(d.glob("fold_*.bin"),
+                          key=lambda p: p.stat().st_mtime, reverse=True)[keep:]:
+            try:
+                old.unlink()
+            except Exception:
+                pass
+        return str(dst)
+    except Exception as exc:
+        log.debug("preserve_suspected_fold failed: %s", exc)
+        return None
+
+
 def analyze_positioning(img) -> dict:
     """Geometric patient-positioning proxies from the reconstructed panoramic.
 
