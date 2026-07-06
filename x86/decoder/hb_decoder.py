@@ -102,6 +102,54 @@ log = logging.getLogger("hb_decoder")
 # ╚══════════════════════════════════════════════════════════════════════════════
 _fill_call_count = 0
 
+# ── Experimental Sidexis tone match (opt-in) ──────────────────────────────────
+# A 256-entry LUT fitted from a real matched pair (our reconstruction vs a
+# Sidexis TIFF export of the same capture) that pulls our output's brightness/
+# contrast toward the Sidexis look (median ~167 → ~104; MAE to Sidexis dropped
+# 24% → 14.5% on the fit pair). DISABLED by default — it only applies when
+# explicitly opted in, so default output is unchanged. Enable for eyeball
+# testing via env `PUREXS_SIDEXIS_TONE=1` or config.json `"sidexis_tone": true`.
+# v1 is fitted from ONE pair (alexa_test 38495); promote to default only after
+# 2-3 pairs agree (see build_lut_3pair_median.py). See memory
+# sidexis_tone_match_v1.
+_SIDEXIS_TONE_LUT_CACHE: "np.ndarray | None" = None
+_SIDEXIS_TONE_LUT_LOADED = False
+
+
+def _sidexis_tone_enabled() -> bool:
+    """True when the experimental Sidexis tone LUT should be applied."""
+    import os as _os
+    if _os.environ.get("PUREXS_SIDEXIS_TONE", "").strip() in ("1", "true", "True"):
+        return True
+    try:
+        import json as _json
+        cfg = get_data_dir() / "config.json"
+        if cfg.exists():
+            return bool(_json.loads(cfg.read_text()).get("sidexis_tone", False))
+    except Exception:
+        pass
+    return False
+
+
+def _load_sidexis_tone_lut() -> "np.ndarray | None":
+    """Load the 256-entry uint8 Sidexis tone LUT, cached. Returns None if absent."""
+    global _SIDEXIS_TONE_LUT_CACHE, _SIDEXIS_TONE_LUT_LOADED
+    if _SIDEXIS_TONE_LUT_LOADED:
+        return _SIDEXIS_TONE_LUT_CACHE
+    _SIDEXIS_TONE_LUT_LOADED = True
+    for p in (get_data_dir() / "sidexis_tone_lut_v1.npy",
+              Path(__file__).parent / "sidexis_tone_lut_v1.npy"):
+        try:
+            if p.exists():
+                lut = np.load(str(p)).astype(np.uint8).ravel()
+                if lut.size == 256:
+                    _SIDEXIS_TONE_LUT_CACHE = lut
+                    log.info("Sidexis tone LUT loaded: %s", p.name)
+                    break
+        except Exception as exc:
+            log.debug("Sidexis tone LUT load failed (%s): %s", p, exc)
+    return _SIDEXIS_TONE_LUT_CACHE
+
 def _verify_fill_written(result_segment, bs, be, predicted):
     """Q4 Check: Spot-check that predicted values were actually written to the result."""
     written = []
@@ -3329,6 +3377,18 @@ def reconstruct_image(
     # Upper crowns face down, lower crowns face up, patient's right on
     # viewer's left. L/R placement is preserved (180° rotation, not mirror).
     img_pil = img_pil.transpose(Image.ROTATE_180)
+
+    # ── Experimental Sidexis tone match (opt-in, default OFF) ─────────
+    # Final per-pixel LUT that maps our tonal output toward a Sidexis TIFF
+    # reference (darker midtones + more contrast). A no-op unless enabled
+    # via env PUREXS_SIDEXIS_TONE=1 or config.json "sidexis_tone": true, so
+    # default behaviour is byte-identical. Applied last because the LUT was
+    # fitted on the finished (post-sharpen, post-rotate) 8-bit image.
+    if _sidexis_tone_enabled():
+        _tone_lut = _load_sidexis_tone_lut()
+        if _tone_lut is not None:
+            img_pil = img_pil.point(_tone_lut.tolist())
+            log.info("Sidexis tone match applied (experimental v1)")
 
     log.info("Reconstructed: %dx%d  percentile=[%.0f, %.0f]",
              width, height, low, high)
