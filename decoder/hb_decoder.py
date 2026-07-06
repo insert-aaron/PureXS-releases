@@ -2309,22 +2309,74 @@ def reconstruct_image(
                 rightmost_30, _col_peak, _col_thresh,
             )
             _exp_col_hi = width - 25
+    # ── Corrupt detector-row detection (dropout-driven) ──────────────
+    # Some units (observed on DESKTOP-M1EPQEU / "SA") emit corrupt rows in
+    # the lower detector: near-zero dropout patches (inline telemetry /
+    # calibration residue) flanked by bright spike rows. Their row
+    # position VARIES scan-to-scan (it tracks the byte stream, so it is
+    # not a fixed hardware bad-row region). After the final 180° rotate,
+    # detector-bottom → output-top, so an uncropped corrupt band blows the
+    # top of the panoramic to pure white (~20% clip vs ~2% on clean units)
+    # plus horizontal banding. We flag such rows by their near-zero pixel
+    # fraction (a scale-invariant floor so it generalises across detector
+    # gains), then below: crop edge-contiguous flagged rows and inpaint
+    # interior ones. Clean units flag ~0 rows, so their output is
+    # unchanged. NB: do NOT flag by a global bright-spike threshold — that
+    # catches legitimate bright anatomy rows and mis-crops good scans.
+    _cf_lo, _cf_hi = int(width * 0.15), int(width * 0.85)
+    if _cf_hi > _cf_lo + 10:
+        _cf_region = img_array[:, _cf_lo:_cf_hi]
+        _glob_med = float(np.median(_cf_region))
+        _drop_floor = max(800.0, 0.30 * _glob_med)
+        _dropout_frac = np.mean(_cf_region < _drop_floor, axis=1)
+    else:
+        _dropout_frac = np.zeros(height, dtype=np.float64)
+    _corrupt_row = _dropout_frac > 0.03
+    _n_corrupt = int(_corrupt_row.sum())
+
     # Row bounds computed over active columns only so pre-exposure
     # columns don't drag the row mean below threshold near the edges.
     if _exp_col_hi > _exp_col_lo:
         _row_means = np.mean(img_f[:, _exp_col_lo:_exp_col_hi + 1], axis=1)
     else:
         _row_means = np.mean(img_f, axis=1)
-    _row_peak = float(np.max(_row_means)) if _row_means.size else 1.0
+    # Corrupt rows are not valid content: zero them for the boundary
+    # walk-in so a bright spike embedded in a corrupt edge band cannot
+    # halt the crop early (the bug that left SA's blown top-band in the
+    # image — the walk stopped at row 1308 on a spike instead of ~1231).
+    _row_means_walk = _row_means.copy()
+    _row_means_walk[_corrupt_row] = 0.0
+    _row_peak = float(np.max(_row_means_walk)) if _row_means_walk.size else 1.0
     _row_thresh = max(_row_peak * 0.08, 1.0)
     _exp_row_lo = 0
-    while _exp_row_lo < height - 1 and _row_means[_exp_row_lo] < _row_thresh:
+    while _exp_row_lo < height - 1 and _row_means_walk[_exp_row_lo] < _row_thresh:
         _exp_row_lo += 1
     _exp_row_hi = height - 1
-    while _exp_row_hi > 0 and _row_means[_exp_row_hi] < _row_thresh:
+    while _exp_row_hi > 0 and _row_means_walk[_exp_row_hi] < _row_thresh:
         _exp_row_hi -= 1
-    log.info("Exposure bounds: cols [%d, %d], rows [%d, %d]",
-             _exp_col_lo, _exp_col_hi, _exp_row_lo, _exp_row_hi)
+
+    # A corrupt band that sits just INSIDE the detector edge (not right at
+    # it) still blows out: the dim/low-signal rows between the band and the
+    # edge invert to bright, and inpainting the band from its neighbours
+    # doesn't help because those neighbours are themselves in the dim edge
+    # region (observed on SA scan_124513, corrupt band at rows 1170-1250
+    # with a dim tail below it to 1315). So when corrupt rows appear in the
+    # outer quarter of the detector, crop the whole band — pull the bound
+    # past the outermost corrupt row toward the edge. Capped so we never
+    # remove more than the outer ~18% of the detector, and only triggered
+    # when corruption is actually present (clean units are untouched).
+    _MAX_EDGE_CROP = int(height * 0.18)
+    _bot_corrupt = np.nonzero(_corrupt_row[height - _MAX_EDGE_CROP:])[0]
+    if _bot_corrupt.size:
+        _band_top = (height - _MAX_EDGE_CROP) + int(_bot_corrupt.min())
+        _exp_row_hi = min(_exp_row_hi, _band_top - 1)
+    _top_corrupt = np.nonzero(_corrupt_row[:_MAX_EDGE_CROP])[0]
+    if _top_corrupt.size:
+        _band_bot = int(_top_corrupt.max())
+        _exp_row_lo = max(_exp_row_lo, _band_bot + 1)
+
+    log.info("Exposure bounds: cols [%d, %d], rows [%d, %d] (%d corrupt rows flagged)",
+             _exp_col_lo, _exp_col_hi, _exp_row_lo, _exp_row_hi, _n_corrupt)
 
     # ── Die junction stitching ────────────────────────────────────────
     #   The DX41 detector has two vertically stacked CMOS dies.  They
@@ -2449,6 +2501,17 @@ def reconstruct_image(
             spike_rows.add(r)
         elif row_means[r] > global_med * 5:
             spike_rows.add(r)
+
+    # Interior corrupt rows (dropout residue that fell INSIDE the exposure
+    # bounds rather than at the edge — e.g. SA scan_124513, band at rows
+    # 1170-1250) are inpainted from clean neighbours. Edge-contiguous
+    # corrupt rows were already cropped by the boundary walk-in above and
+    # lie outside [_exp_row_lo, _exp_row_hi], so they are skipped here. The
+    # interpolation loop below reaches past contiguous corrupt blocks to
+    # the nearest clean rows on each side, so a wide band fills smoothly.
+    for r in np.nonzero(_corrupt_row)[0]:
+        if _exp_row_lo < r < _exp_row_hi:
+            spike_rows.add(int(r))
 
     for r in sorted(spike_rows):
         above = r - 1
@@ -3800,6 +3863,21 @@ class SironaLiveClient:
 
         scan_buffer = bytearray()
         chunk_count = 0
+
+        # Clear batch results from the PREVIOUS scan up front. These attrs are
+        # not initialised in __init__ and are only overwritten at the very end
+        # of this method (line ~self._scan_scanlines = scanlines), so between
+        # scans they retain the prior patient's data. A completion/event
+        # handler on the GUI thread (_on_expose_complete) races to read
+        # _scan_scanlines and, finding the stale full batch longer than the
+        # freshly-streamed lines, reconstructs the PREVIOUS scan's image for
+        # the new patient — the "distortion patient-after-patient" bug, which
+        # survives relaunch inconsistently because it is timing-dependent.
+        # The WPF client already clears its ImageBuffer at arm; this is the
+        # Python-side equivalent.
+        self._scan_scanlines = []
+        self._scan_kv_peak = 0.0
+        self._repair_mask = None
 
         # Seed buffer with data from the EXPOSE_NOTIFY payload
         initial = getattr(self, '_expose_initial_data', b'')
