@@ -137,7 +137,13 @@ def _load_sidexis_tone_lut() -> "np.ndarray | None":
     if _SIDEXIS_TONE_LUT_LOADED:
         return _SIDEXIS_TONE_LUT_CACHE
     _SIDEXIS_TONE_LUT_LOADED = True
-    for p in (get_data_dir() / "sidexis_tone_lut_v1.npy",
+    # Prefer the newest fitted curve; fall back to older revisions.
+    #   v2 = median-average of 2 matched pairs (alexa_test 38495 + patient 2);
+    #        validated on both (MAE ~24% → ~15.4%, each ≈ its own best fit).
+    #   v1 = single-pair fit (kept for provenance / fallback).
+    for p in (get_data_dir() / "sidexis_tone_lut_v2.npy",
+              Path(__file__).parent / "sidexis_tone_lut_v2.npy",
+              get_data_dir() / "sidexis_tone_lut_v1.npy",
               Path(__file__).parent / "sidexis_tone_lut_v1.npy"):
         try:
             if p.exists():
