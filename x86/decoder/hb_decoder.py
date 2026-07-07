@@ -238,6 +238,35 @@ _SIDEXIS_BAND_GAINS_CACHE: "tuple | None" = None
 _SIDEXIS_BAND_GAINS_LOADED = False
 
 
+def _render_mode() -> str:
+    """Resolve the output render path: "sidexis" (default) or "hd" (legacy).
+
+    "sidexis" skips the HD chain's Gaussian pre-blur, CLAHE tile equalization,
+    bilateral denoise and unsharp — the steps that destroy native detector
+    grain and regionally redistribute brightness (the two things that made the
+    output read as "flatter/smoother/softer" than Sidexis side-by-side). The
+    global look is then produced by the adaptive tone match + MUSICA-lite
+    band gains, mirroring the real Sidexis chain (global curve + MUSICA).
+    Override via env PUREXS_RENDER=hd|sidexis or config.json "render_mode".
+    """
+    import os as _os
+    env = _os.environ.get("PUREXS_RENDER", "").strip().lower()
+    if env in ("hd", "classic", "legacy"):
+        return "hd"
+    if env in ("sidexis", "film"):
+        return "sidexis"
+    try:
+        import json as _json
+        cfg = get_data_dir() / "config.json"
+        if cfg.exists():
+            v = str(_json.loads(cfg.read_text()).get("render_mode", "sidexis")).lower()
+            if v in ("hd", "classic", "legacy"):
+                return "hd"
+    except Exception:
+        pass
+    return "sidexis"
+
+
 def _load_sidexis_band_gains() -> "tuple | None":
     """Load (sigmas, gains) for the MUSICA-lite detail match, cached."""
     global _SIDEXIS_BAND_GAINS_CACHE, _SIDEXIS_BAND_GAINS_LOADED
@@ -2347,12 +2376,25 @@ def reconstruct_image(
     clahe_clip: float = 2.5,
     clahe_tile: int = 8,
     unsharp: tuple[tuple[float, int, int], ...] = ((4, 45, 8), (1.5, 75, 5)),
+    render: str | None = None,
 ) -> Image.Image | None:
     # Tone/contrast knobs are keyword args with defaults == the production
     # "HD" tuning, so existing callers are unchanged. They exist so the tone
     # can be swept against a Sidexis reference (e.g. a softer Sidexis-ward
     # tune: pct_high=98, clahe_clip=1.5, clahe_tile=32, unsharp=((1,60,3),))
     # without forking the function. See sidexis_validation_was_circular memory.
+    #
+    # render: "sidexis" (default via _render_mode) or "hd" (legacy). The
+    # side-by-side verdict on matched pairs was that the HD chain's blur +
+    # CLAHE + bilateral + unsharp makes output flatter/smoother/softer than
+    # Sidexis and regionally redistributes brightness; "sidexis" skips those
+    # and produces the look via adaptive tone + MUSICA band gains instead.
+    _render = (render or _render_mode()).lower()
+    if _render == "sidexis":
+        # Wider stretch: keep highlight/shadow information for the adaptive
+        # tone LUT to place (the HD p2/p95 clip crushes both ends up front).
+        pct_low, pct_high = 0.5, 99.7
+        unsharp = ()
     """Reconstruct a panoramic image from decoded scanlines.
 
     Each scanline contributes one column of the panoramic image.  The
@@ -3269,27 +3311,34 @@ def reconstruct_image(
         normalized = 1.0 - normalized
 
     # ── Conservative CLAHE for local contrast (root/bone detail) ─────
+    # HD render only. The "sidexis" render skips the pre-blur, CLAHE and the
+    # bilateral below entirely: CLAHE's per-tile equalization regionally
+    # redistributes brightness (muddy bone vs Sidexis's airy anatomy) and the
+    # blur/bilateral destroy the native detector grain that gives Sidexis its
+    # film-like texture. In "sidexis" mode the look is produced downstream by
+    # the adaptive tone match + MUSICA-lite band gains on unsmoothed data.
     img_16 = (normalized * 65535).astype(np.uint16)
-    try:
-        import cv2
-        # Pre-CLAHE blur dropped (sigma 0.6 → 0.3) to preserve more
-        # high-frequency detail going INTO CLAHE — the bilateral +
-        # median pass downstream removes the resulting noise without
-        # taking the anatomy with it.
-        img_16 = cv2.GaussianBlur(img_16, (0, 0), sigmaX=0.3)
-        # clipLimit 1.5 → 2.5 to push more local contrast through CLAHE,
-        # paired with the tighter p1/p97 percentile stretch above.
-        # Together they close the mid-grey gap with Sidexis. tile 20×20
-        # → 8×8: smaller tiles give finer local adaptation, lighting up
-        # trabecular pattern in flat bone — the "Sidexis HD" signature
-        # on root anatomy. Single-variable test on top of an otherwise
-        # literal 6041ae1 baseline (NLM/aggressive-unsharp/seam-pre-
-        # smooth/batch-gain-smooth all reverted out).
-        clahe = cv2.createCLAHE(clipLimit=clahe_clip,
-                                tileGridSize=(clahe_tile, clahe_tile))
-        img_16 = clahe.apply(img_16)
-    except ImportError:
-        pass
+    if _render != "sidexis":
+        try:
+            import cv2
+            # Pre-CLAHE blur dropped (sigma 0.6 → 0.3) to preserve more
+            # high-frequency detail going INTO CLAHE — the bilateral +
+            # median pass downstream removes the resulting noise without
+            # taking the anatomy with it.
+            img_16 = cv2.GaussianBlur(img_16, (0, 0), sigmaX=0.3)
+            # clipLimit 1.5 → 2.5 to push more local contrast through CLAHE,
+            # paired with the tighter p1/p97 percentile stretch above.
+            # Together they close the mid-grey gap with Sidexis. tile 20×20
+            # → 8×8: smaller tiles give finer local adaptation, lighting up
+            # trabecular pattern in flat bone — the "Sidexis HD" signature
+            # on root anatomy. Single-variable test on top of an otherwise
+            # literal 6041ae1 baseline (NLM/aggressive-unsharp/seam-pre-
+            # smooth/batch-gain-smooth all reverted out).
+            clahe = cv2.createCLAHE(clipLimit=clahe_clip,
+                                    tileGridSize=(clahe_tile, clahe_tile))
+            img_16 = clahe.apply(img_16)
+        except ImportError:
+            pass
     img_8 = (img_16 >> 8).astype(np.uint8)
 
     # Edge-preserving denoise — bridges grain in flat bone/soft-tissue
@@ -3301,11 +3350,12 @@ def reconstruct_image(
     # enamel/apex detail while preserving enough column coherence for
     # consensus-based seam detection downstream. d=9 spatial reach
     # kept; 3×3 median blur stays out (collapsed trabecular texture).
-    try:
-        import cv2 as _cv2_bf
-        img_8 = _cv2_bf.bilateralFilter(img_8, d=9, sigmaColor=18, sigmaSpace=18)
-    except ImportError:
-        pass
+    if _render != "sidexis":
+        try:
+            import cv2 as _cv2_bf
+            img_8 = _cv2_bf.bilateralFilter(img_8, d=9, sigmaColor=18, sigmaSpace=18)
+        except ImportError:
+            pass
 
     # ── Wide dead-row gradient at rows 419-435 (17 rows) ──────────────
     # Tightening percentile to p3/p94 + clipLimit=2.5 + tile (8,8)
