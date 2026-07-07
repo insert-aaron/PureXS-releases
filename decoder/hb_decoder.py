@@ -106,29 +106,38 @@ _fill_call_count = 0
 # A 256-entry LUT fitted from a real matched pair (our reconstruction vs a
 # Sidexis TIFF export of the same capture) that pulls our output's brightness/
 # contrast toward the Sidexis look (median ~167 → ~104; MAE to Sidexis dropped
-# 24% → 14.5% on the fit pair). DISABLED by default — it only applies when
-# explicitly opted in, so default output is unchanged. Enable for eyeball
-# testing via env `PUREXS_SIDEXIS_TONE=1` or config.json `"sidexis_tone": true`.
-# v1 is fitted from ONE pair (alexa_test 38495); promote to default only after
-# 2-3 pairs agree (see build_lut_3pair_median.py). See memory
+# 24% → ~15% on two independent matched pairs that agree within 0.1%).
+# ENABLED BY DEFAULT (v2) so every install gets the Sidexis-matched tone with
+# no per-system config. Disable per-site via env `PUREXS_SIDEXIS_TONE=0` or
+# config.json `"sidexis_tone": false` (the off-switch). v2 = median-average of
+# 2 matched pairs; both validated at normal exposure — the one residual risk is
+# an extreme-exposure patient (very thin/bright or large/dense) where a fixed
+# 1-D curve could over-darken, hence the per-site off-switch. See memory
 # sidexis_tone_match_v1.
 _SIDEXIS_TONE_LUT_CACHE: "np.ndarray | None" = None
 _SIDEXIS_TONE_LUT_LOADED = False
 
 
 def _sidexis_tone_enabled() -> bool:
-    """True when the experimental Sidexis tone LUT should be applied."""
+    """True unless explicitly disabled. Sidexis tone match ships ON by default.
+
+    Precedence: env PUREXS_SIDEXIS_TONE (0/1) wins; else config.json
+    "sidexis_tone" (defaults True when the key is absent); else on.
+    """
     import os as _os
-    if _os.environ.get("PUREXS_SIDEXIS_TONE", "").strip() in ("1", "true", "True"):
+    env = _os.environ.get("PUREXS_SIDEXIS_TONE", "").strip()
+    if env in ("0", "false", "False"):
+        return False
+    if env in ("1", "true", "True"):
         return True
     try:
         import json as _json
         cfg = get_data_dir() / "config.json"
         if cfg.exists():
-            return bool(_json.loads(cfg.read_text()).get("sidexis_tone", False))
+            return bool(_json.loads(cfg.read_text()).get("sidexis_tone", True))
     except Exception:
         pass
-    return False
+    return True
 
 
 def _load_sidexis_tone_lut() -> "np.ndarray | None":
