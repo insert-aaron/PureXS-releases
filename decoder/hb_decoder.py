@@ -2806,12 +2806,27 @@ def reconstruct_image(
     # misalignment visible across the whole panoramic).
     from scipy.ndimage import gaussian_filter1d as _gf1d_col
     _col_arr = (normalized * 255).astype(np.float32)
-    _col_means = _col_arr[50:650, :].mean(axis=0).astype(np.float64)
+    if _render == "sidexis":
+        # Sample the full content band: the cervical-spine shadow that darkens
+        # the anterior/midline columns is strongest in the mid/lower detector
+        # rows, which the historical 50:650 window misses entirely.
+        _cm_lo, _cm_hi = height // 7, height * 6 // 7
+        _col_means = _col_arr[_cm_lo:_cm_hi, :].mean(axis=0).astype(np.float64)
+    else:
+        _col_means = _col_arr[50:650, :].mean(axis=0).astype(np.float64)
 
     # Wide pass — corrects broad per-column gain drift without flattening anatomy
     _col_wide = _gf1d_col(_col_means, sigma=80)
     _col_norm_wide = _col_wide.mean() / np.maximum(_col_wide, 1.0)
-    _col_norm_wide = np.clip(_col_norm_wide, 0.85, 1.15)
+    # Sidexis render allows a wider correction range: the cervical-spine
+    # shadow darkens the anterior/midline columns (mid-vs-sides gap -56 on
+    # ours vs -26 on the Sidexis reference — Sidexis compensates about half
+    # of the natural shadow). The ±15% clip can't reach that; HD keeps the
+    # historical conservative clip.
+    if _render == "sidexis":
+        _col_norm_wide = np.clip(_col_norm_wide, 0.75, 1.45)
+    else:
+        _col_norm_wide = np.clip(_col_norm_wide, 0.85, 1.15)
 
     # Narrow pass — ratio of raw column mean to smoothed neighborhood,
     # targets single-column brightness spikes (sharp vertical lines).
