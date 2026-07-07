@@ -225,6 +225,59 @@ def _sidexis_adaptive_lut(img8: "np.ndarray") -> "np.ndarray | None":
     return lut.astype(np.uint8)
 
 
+# ── MUSICA-lite multiscale detail match ──────────────────────────────────────
+# Sidexis (Agfa MUSICA) carries systematically MORE fine structural detail than
+# our CLAHE+unsharp output at every spatial frequency band — measured on three
+# same-patient matched pairs, ours needs ×1.1–1.6 per band, biggest deficit in
+# the σ1.5–3 (fine trabecular) bands, and the required gains agree across
+# patients (median used). This stage decomposes the finished image into a
+# Gaussian pyramid of detail bands and multiplies each band by its fixed gain,
+# closing the "crunchy vs creamy" texture gap that a global tone curve cannot.
+# Gains live in sidexis_band_gains.npy (shape (2, N): [sigmas; gains]).
+_SIDEXIS_BAND_GAINS_CACHE: "tuple | None" = None
+_SIDEXIS_BAND_GAINS_LOADED = False
+
+
+def _load_sidexis_band_gains() -> "tuple | None":
+    """Load (sigmas, gains) for the MUSICA-lite detail match, cached."""
+    global _SIDEXIS_BAND_GAINS_CACHE, _SIDEXIS_BAND_GAINS_LOADED
+    if _SIDEXIS_BAND_GAINS_LOADED:
+        return _SIDEXIS_BAND_GAINS_CACHE
+    _SIDEXIS_BAND_GAINS_LOADED = True
+    for p in (get_data_dir() / "sidexis_band_gains.npy",
+              Path(__file__).parent / "sidexis_band_gains.npy"):
+        try:
+            if p.exists():
+                arr = np.load(str(p)).astype(np.float64)
+                if arr.ndim == 2 and arr.shape[0] == 2 and arr.shape[1] >= 2:
+                    _SIDEXIS_BAND_GAINS_CACHE = (arr[0], arr[1])
+                    log.info("Sidexis band gains loaded: %s", p.name)
+                    break
+        except Exception as exc:
+            log.debug("Sidexis band gains load failed (%s): %s", p, exc)
+    return _SIDEXIS_BAND_GAINS_CACHE
+
+
+def _sidexis_musica_lite(img8: "np.ndarray") -> "np.ndarray | None":
+    """Apply the fixed per-band detail gains to a finished 8-bit image.
+    Returns the enhanced uint8 array, or None if gains are unavailable."""
+    bands = _load_sidexis_band_gains()
+    if bands is None:
+        return None
+    sigmas, gains = bands
+    from scipy.ndimage import gaussian_filter as _gf
+    prev = img8.astype(np.float64)
+    detail = []
+    for s in sigmas:
+        g = _gf(prev, float(s))
+        detail.append(prev - g)
+        prev = g
+    out = prev  # residual base (coarsest scales — brightness carrier)
+    for b, gn in zip(detail, gains):
+        out = out + b * float(gn)
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
 def _verify_fill_written(result_segment, bs, be, predicted):
     """Q4 Check: Spot-check that predicted values were actually written to the result."""
     written = []
@@ -3472,6 +3525,13 @@ def reconstruct_image(
             if _tone_lut is not None:
                 img_pil = img_pil.point(_tone_lut.tolist())
                 log.info("Sidexis tone match applied (fixed LUT fallback)")
+        # MUSICA-lite multiscale detail match — closes the texture gap
+        # (Sidexis carries ~1.1-1.6x more per-band fine detail than our
+        # CLAHE+unsharp output; gains fit from 3 same-patient pairs).
+        _mus = _sidexis_musica_lite(np.asarray(img_pil))
+        if _mus is not None:
+            img_pil = Image.fromarray(_mus, mode="L")
+            log.info("Sidexis MUSICA-lite detail match applied")
 
     log.info("Reconstructed: %dx%d  percentile=[%.0f, %.0f]",
              width, height, low, high)
