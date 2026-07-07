@@ -165,6 +165,66 @@ def _load_sidexis_tone_lut() -> "np.ndarray | None":
             log.debug("Sidexis tone LUT load failed (%s): %s", p, exc)
     return _SIDEXIS_TONE_LUT_CACHE
 
+
+# ── Adaptive Sidexis tone match ───────────────────────────────────────────────
+# The fixed LUT (v2) maps a *fixed* input level to a Sidexis output level, so it
+# only lands on the Sidexis tone for patients whose baseline brightness matches
+# the calibration patients (~167). A brighter/darker patient falls short (e.g. a
+# Bachman scan at raw median 186 → only 117 with the fixed LUT vs the ~103 target).
+# The adaptive path instead matches THIS image's tonal landmarks (anchor
+# percentiles) onto the canonical Sidexis target distribution, so every patient
+# lands on the Sidexis tone regardless of their input brightness — true 1:1 on
+# brightness, and it cannot over-darken a dark patient (it targets a distribution,
+# not a fixed shift). Target = mean of Sidexis-reference anchor percentiles,
+# stored in sidexis_target_anchors.npy (shape (2, N): [percentiles; values]).
+_SIDEXIS_TARGET_CACHE: "tuple | None" = None
+_SIDEXIS_TARGET_LOADED = False
+
+
+def _load_sidexis_target() -> "tuple | None":
+    """Load the canonical Sidexis (percentiles, target_values) anchors, cached."""
+    global _SIDEXIS_TARGET_CACHE, _SIDEXIS_TARGET_LOADED
+    if _SIDEXIS_TARGET_LOADED:
+        return _SIDEXIS_TARGET_CACHE
+    _SIDEXIS_TARGET_LOADED = True
+    for p in (get_data_dir() / "sidexis_target_anchors.npy",
+              Path(__file__).parent / "sidexis_target_anchors.npy"):
+        try:
+            if p.exists():
+                arr = np.load(str(p)).astype(np.float64)
+                if arr.ndim == 2 and arr.shape[0] == 2 and arr.shape[1] >= 3:
+                    _SIDEXIS_TARGET_CACHE = (arr[0], arr[1])
+                    log.info("Sidexis target anchors loaded: %s", p.name)
+                    break
+        except Exception as exc:
+            log.debug("Sidexis target load failed (%s): %s", p, exc)
+    return _SIDEXIS_TARGET_CACHE
+
+
+def _sidexis_adaptive_lut(img8: "np.ndarray") -> "np.ndarray | None":
+    """Build a per-image 256-entry LUT mapping this image's anchor percentiles
+    onto the Sidexis target. Returns None if the target is unavailable or the
+    image has too little foreground to fit a stable curve."""
+    target = _load_sidexis_target()
+    if target is None:
+        return None
+    anchors, tvals = target
+    fg = img8[(img8 > 6) & (img8 < 252)]
+    if fg.size < 10000:
+        return None
+    src = np.percentile(fg, anchors)
+    xs = np.concatenate([[0.0], src, [255.0]])
+    ys = np.concatenate([[0.0], tvals, [255.0]])
+    # Enforce strictly increasing source knots so interp is well-defined.
+    for i in range(1, len(xs)):
+        if xs[i] <= xs[i - 1]:
+            xs[i] = xs[i - 1] + 0.5
+    lut = np.interp(np.arange(256), xs, ys)
+    lut = np.maximum.accumulate(np.clip(lut, 0, 255))  # monotone
+    lut[:6] = np.arange(6)                              # keep pure-black letterbox
+    return lut.astype(np.uint8)
+
+
 def _verify_fill_written(result_segment, bs, be, predicted):
     """Q4 Check: Spot-check that predicted values were actually written to the result."""
     written = []
@@ -3393,17 +3453,25 @@ def reconstruct_image(
     # viewer's left. L/R placement is preserved (180° rotation, not mirror).
     img_pil = img_pil.transpose(Image.ROTATE_180)
 
-    # ── Experimental Sidexis tone match (opt-in, default OFF) ─────────
-    # Final per-pixel LUT that maps our tonal output toward a Sidexis TIFF
-    # reference (darker midtones + more contrast). A no-op unless enabled
-    # via env PUREXS_SIDEXIS_TONE=1 or config.json "sidexis_tone": true, so
-    # default behaviour is byte-identical. Applied last because the LUT was
-    # fitted on the finished (post-sharpen, post-rotate) 8-bit image.
+    # ── Sidexis tone match (default ON, per-site off-switch) ──────────
+    # Match this image's tone to the Sidexis look. Preferred path is ADAPTIVE:
+    # remap this image's anchor percentiles onto the canonical Sidexis target
+    # distribution, so every patient lands on the Sidexis tone regardless of
+    # baseline brightness (true 1:1 on brightness; cannot over-darken a dark
+    # patient). Falls back to the fixed v2 LUT if the target anchors file isn't
+    # available. Applied last, on the finished (post-sharpen, post-rotate)
+    # 8-bit image. No-op if disabled or neither target nor LUT is present.
     if _sidexis_tone_enabled():
-        _tone_lut = _load_sidexis_tone_lut()
-        if _tone_lut is not None:
-            img_pil = img_pil.point(_tone_lut.tolist())
-            log.info("Sidexis tone match applied (experimental v1)")
+        _img8 = np.asarray(img_pil)
+        _adaptive = _sidexis_adaptive_lut(_img8)
+        if _adaptive is not None:
+            img_pil = img_pil.point(_adaptive.tolist())
+            log.info("Sidexis tone match applied (adaptive per-image)")
+        else:
+            _tone_lut = _load_sidexis_tone_lut()
+            if _tone_lut is not None:
+                img_pil = img_pil.point(_tone_lut.tolist())
+                log.info("Sidexis tone match applied (fixed LUT fallback)")
 
     log.info("Reconstructed: %dx%d  percentile=[%.0f, %.0f]",
              width, height, low, high)
