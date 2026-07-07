@@ -3400,6 +3400,20 @@ def reconstruct_image(
     if _exp_col_hi > _exp_col_lo + 100:
         from scipy.ndimage import gaussian_filter1d as _gf1d_row
         _band = img_8[:, _exp_col_lo:_exp_col_hi + 1].astype(np.float32)
+        # The step/consensus statistics below were tuned on the HD chain's
+        # bilateral-smoothed data. The sidexis render preserves native grain,
+        # which dilutes the per-column step estimate (observed: a real seam at
+        # row 543 measured step 3.9 vs the 4.0 trigger — left uncorrected as a
+        # visible line). Smooth a DETECTION-ONLY copy with the same bilateral
+        # the HD chain uses; the correction still applies to the real img_8,
+        # so the rendered grain is untouched.
+        if _render == "sidexis":
+            try:
+                import cv2 as _cv2_dj
+                _band = _cv2_dj.bilateralFilter(
+                    _band, d=9, sigmaColor=18, sigmaSpace=18)
+            except ImportError:
+                pass
         # Per-row step at row r = mean(rows r..r+9) - mean(rows r-10..r-1)
         # Computed per column. A real hardware step has consistent sign
         # across columns; anatomy has mixed signs.
@@ -3444,9 +3458,16 @@ def reconstruct_image(
         # Acosta 2026-05-04 (row 554, step=+12, consensus=75%) was
         # rejected by the previous tighter thresholds — the white
         # center line in that scan motivated this loosening.
+        # The 4.0 step floor is calibrated to CLAHE-amplified data (CLAHE
+        # inflates the sub-3% physical gain step into 4-14 grey levels). The
+        # sidexis render skips CLAHE, so the same physical seam measures ~3
+        # grey levels (observed 3.1-3.9 on a visibly-seamed scan) — use a
+        # 2.5 floor there; consensus and the narrow search band still guard
+        # against anatomical false positives.
+        _step_floor = 2.5 if _render == "sidexis" else 4.0
         if (_best_row > 0
                 and _best_consensus >= 0.70
-                and abs(_best_signed_mean) >= 4.0
+                and abs(_best_signed_mean) >= _step_floor
                 and abs(_best_signed_mean) <= 14.0):
             _offset = float(_best_signed_mean)
             _offset = max(-15.0, min(15.0, _offset))
