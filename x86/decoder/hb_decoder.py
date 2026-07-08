@@ -295,7 +295,21 @@ def _sidexis_musica_lite(img8: "np.ndarray") -> "np.ndarray | None":
         return None
     sigmas, gains = bands
     from scipy.ndimage import gaussian_filter as _gf
-    prev = img8.astype(np.float64)
+    img_f = img8.astype(np.float64)
+    # Structure gate (what real MUSICA does): boost detail only where real
+    # structure exists; in flat regions (air, soft tissue, empty field) the
+    # bands carry mostly detector noise, and multiplying that by 1.2-1.7
+    # produces grain Sidexis doesn't show (static-object A/B: Sidexis
+    # texture 1.76 vs our ungated 4.88). Weight w in [0,1] from local
+    # high-pass energy with an ABSOLUTE threshold in grey levels (noise
+    # energy ~1-2, anatomy edges ~5-20), so the gate stays meaningful on
+    # content-poor scenes. Effective gain: g_fit where w=1, 0.4 where w=0
+    # (flat regions get noise SUPPRESSION, not just no boost).
+    _hp = img_f - _gf(img_f, 3.0)
+    _energy = _gf(np.abs(_hp), 8.0)
+    _w = _energy * _energy / (_energy * _energy + 4.0)  # T=2 grey levels
+    _FLAT_GAIN = 0.4
+    prev = img_f
     detail = []
     for s in sigmas:
         g = _gf(prev, float(s))
@@ -303,7 +317,8 @@ def _sidexis_musica_lite(img8: "np.ndarray") -> "np.ndarray | None":
         prev = g
     out = prev  # residual base (coarsest scales — brightness carrier)
     for b, gn in zip(detail, gains):
-        out = out + b * float(gn)
+        eff = _FLAT_GAIN + (float(gn) - _FLAT_GAIN) * _w
+        out = out + b * eff
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
