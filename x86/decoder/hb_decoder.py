@@ -1890,14 +1890,50 @@ def _extract_panoramic(data: bytes, detector_height: int = 0) -> tuple[list[Scan
     log.info("Column phase error: %d px (remainder=%d)", _phase_err, _remainder)
     print(f"PHASE_ERR={_phase_err}", file=sys.stderr)
 
-    # Trim tail to nearest column boundary if remainder exists
-    # (echo detection inaccuracies can leave a small residual)
+    # Trim to nearest column boundary if remainder exists.
+    # Small remainders (echo-detection residue, a few px) always come off the
+    # TAIL — unchanged legacy behaviour. A LARGE remainder usually means the
+    # stream started mid-column (off-phase capture): the surplus belongs at
+    # the HEAD, and tail-trimming folds the panoramic (wrap band / doubled
+    # anatomy). Auto-select: score both candidates by the sharpest jump in
+    # the detector-row mean profile (a fold puts a hard discontinuity where
+    # the wrap lands; a correct reshape is smooth) and keep the smoother one.
+    # Evidence: the Sidexis-pcap capture (remainder 160) reconstructed with a
+    # wrap band under tail-trim; head-trim dropped the discontinuity 15.0→1.2
+    # and produced a clean panoramic. Mid-stream slips won't improve under
+    # either candidate — the score tie keeps legacy tail-trim (no harm).
     remainder_px = (len(clean) // 2) % img_height
     if remainder_px != 0:
         trim_bytes = remainder_px * 2
-        log.warning("Reshape: trimming %d remainder pixels (%d bytes) from tail",
-                    remainder_px, trim_bytes)
-        clean = clean[:-trim_bytes]
+
+        def _wrap_score(buf: bytes) -> float:
+            arr = np.frombuffer(buf, dtype='>u2')
+            w = arr.size // img_height
+            if w < 100:
+                return float("inf")
+            img = arr[:w * img_height].reshape(w, img_height).astype(np.float32)
+            rm = img[w // 5:(4 * w) // 5].mean(axis=0)  # detector-row profile
+            return float(np.abs(np.diff(rm)).max())
+
+        if remainder_px > 50:
+            _s_tail = _wrap_score(bytes(clean[:-trim_bytes]))
+            _s_head = _wrap_score(bytes(clean[trim_bytes:]))
+            if _s_head < _s_tail * 0.75:
+                log.warning(
+                    "Reshape: large remainder %d px — HEAD-trim wins "
+                    "(wrap score head=%.1f vs tail=%.1f), auto-unfolding",
+                    remainder_px, _s_head, _s_tail)
+                clean = clean[trim_bytes:]
+            else:
+                log.warning(
+                    "Reshape: large remainder %d px — keeping tail-trim "
+                    "(wrap score head=%.1f vs tail=%.1f)",
+                    remainder_px, _s_head, _s_tail)
+                clean = clean[:-trim_bytes]
+        else:
+            log.warning("Reshape: trimming %d remainder pixels (%d bytes) from tail",
+                        remainder_px, trim_bytes)
+            clean = clean[:-trim_bytes]
 
     # Verify clean buffer is evenly divisible (trim if not)
     if len(clean) % (img_height * 2) != 0:
