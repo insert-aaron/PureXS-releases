@@ -2409,7 +2409,12 @@ def reconstruct_image(
         # Wider stretch: keep highlight/shadow information for the adaptive
         # tone LUT to place (the HD p2/p95 clip crushes both ends up front).
         pct_low, pct_high = 0.5, 99.7
-        unsharp = ()
+        # Edge sharpening kept, single-pass fine + gentle mid, threshold-
+        # gated (threshold ≈ grain amplitude so flat regions stay film-
+        # like). Dropping ALL sharpening drew clinical feedback: "blurry,
+        # cloudy, needs more definition in tooth/root outlines". The HD
+        # chain's aggressive tuning stays off.
+        unsharp = ((1.5, 90, 4), (3, 40, 6))
     """Reconstruct a panoramic image from decoded scanlines.
 
     Each scanline contributes one column of the panoramic image.  The
