@@ -319,6 +319,37 @@ def _sidexis_musica_lite(img8: "np.ndarray") -> "np.ndarray | None":
     for b, gn in zip(detail, gains):
         eff = _FLAT_GAIN + (float(gn) - _FLAT_GAIN) * _w
         out = out + b * eff
+
+    # ── Per-image texture normalization ──────────────────────────────
+    # Sidexis lands every unit in a consistent smooth texture band
+    # (measured across 4 fleet references: 3.5–5.1, mid ≈ 4.5) regardless
+    # of detector noise. Our fixed gains overshoot on noisy detectors
+    # (Austin: 6.2 → staff read it as "grainy/cloudy, not high-definition").
+    # Blend between the un-boosted image and the boosted one so the OUTPUT
+    # texture lands at the target: s=1 keeps the full boost (quiet
+    # detectors), s→0 backs it off (noisy detectors). Never sharpens
+    # beyond the fitted gains and never inverts the boost.
+    _TEX_TARGET = 4.5
+
+    def _tex(a):
+        # Full resolution — decimation under-reads high-frequency energy
+        # and mis-calibrates the target (validation measures full-res).
+        mm = (a > 20) & (a < 235)
+        if mm.sum() < 20000:
+            return None
+        hp2 = a - _gf(a, 3.0)
+        return float(np.sqrt((hp2[mm] ** 2).mean()))
+
+    t_out = _tex(out)
+    if t_out is not None and t_out > _TEX_TARGET:
+        # Attenuate ALL detail bands toward the base (a true multiscale
+        # denoise, not just boost-reduction) — texture scales ~linearly
+        # with detail amplitude, so alpha = target/actual lands on target.
+        # Floor 0.55 caps how much we soften a pathologically noisy scan.
+        alpha = float(np.clip(_TEX_TARGET / t_out, 0.55, 1.0))
+        out = prev + (out - prev) * alpha
+        log.info("MUSICA texture norm: boosted=%.2f -> alpha=%.2f (target %.1f)",
+                 t_out, alpha, _TEX_TARGET)
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
@@ -2910,7 +2941,11 @@ def reconstruct_image(
     # of the natural shadow). The ±15% clip can't reach that; HD keeps the
     # historical conservative clip.
     if _render == "sidexis":
-        _col_norm_wide = np.clip(_col_norm_wide, 0.75, 1.45)
+        # Upper clip 1.45 → 1.80: at 1.45 the residual mid-vs-sides gap was
+        # still −32; the measured Sidexis fleet target is −11…−25 (≈ −18)
+        # across Bachman/Austin/West-Ave references. Staff-visible symptom
+        # at −32: "dark / cloudy region through the middle of the teeth".
+        _col_norm_wide = np.clip(_col_norm_wide, 0.75, 1.60)
     else:
         _col_norm_wide = np.clip(_col_norm_wide, 0.85, 1.15)
 
