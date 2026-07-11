@@ -2499,6 +2499,36 @@ def reconstruct_image(
 
     img_f = img_array.astype(np.float32)
 
+    # ── Per-pixel corrupt-speck repair (dropout/spike despeckle) ─────
+    # The DESKTOP-M1EPQEU (SA / West Avenue) unit emits corrupt pixels
+    # whose ROW POSITION DRIFTS as the sweep progresses, tracing dashed
+    # DIAGONAL trails across the panoramic. The per-row corrupt-row
+    # detection below can't catch them (per-row density stays under its
+    # threshold), so repair per-pixel here, before dark correction:
+    # compare against a VERTICAL local median (the drift means same-column
+    # vertical neighbours are clean) and replace only pixels that are both
+    # extreme in absolute terms (dropout <~800 raw / spike) AND far from
+    # their local median. Clean units flag a few dozen edge pixels at most
+    # — replacement is masked-only, so their output is untouched.
+    try:
+        from scipy.ndimage import median_filter as _pxmed
+        _act_lo, _act_hi = int(width * 0.1), int(width * 0.9)
+        _gm = float(np.median(img_f[:, _act_lo:_act_hi]))
+        if _gm > 100:
+            _vmed = _pxmed(img_f, size=(9, 1))
+            _dev = np.abs(img_f - _vmed)
+            _corrupt_px = (
+                ((img_f < max(800.0, 0.30 * _gm)) | (img_f > 4.0 * _gm))
+                & (_dev > 0.35 * np.maximum(_vmed, 1.0))
+            )
+            _n_px = int(_corrupt_px.sum())
+            if _n_px > 0:
+                img_f[_corrupt_px] = _vmed[_corrupt_px]
+                log.info("Pixel despeckle: %d corrupt pixels replaced "
+                         "(vertical-median)", _n_px)
+    except ImportError:
+        pass
+
     # ── Dark current correction ──────────────────────────────────────
     #   The first ~100 columns are pre-exposure dark frames (before the
     #   X-ray turns on) and the last ~25 columns are post-exposure.
