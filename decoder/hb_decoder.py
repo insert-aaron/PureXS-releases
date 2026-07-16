@@ -3111,13 +3111,27 @@ def reconstruct_image(
                 _run = [s]
         _grouped_seams.append(int(np.mean(_run)))
 
-    if len(_grouped_seams) >= 2:
+    # PUREXS_NO_ROWSHIFT=1 disables the whole batch row-shift stage — a
+    # diagnostic/escape hatch. If the auto-correlation ever locks onto teeth
+    # periodicity and seams a scan (the failure mode the manual tweaks used to
+    # paper over), reprocessing the .bin with this set yields the un-aligned
+    # image, which is usually cleaner than a mis-aligned one.
+    if len(_grouped_seams) >= 2 and not _os.environ.get("PUREXS_NO_ROWSHIFT"):
         MAX_SHIFT = 6
         STRIP_W = 10   # cols on each side of seam used for correlation
         STRIP_GAP = 3  # skip cols immediately adjacent to seam (distorted)
 
         DAMPEN = 1.0       # apply full measured shift — dampening leaves residual seams
         MIN_CORR = 0.45    # v13 top-ROI threshold — proven to reject noise-driven bogus dys
+        # NOTE (2026-07-16): teeth-periodicity can alias the seam correlation
+        # (true peak ≈+6, a second peak ≈+13 one tooth-period away). Two attempts
+        # to reject those shifts — a corr-gain+boundary gate, and a wide-search
+        # off-range-peak reject — BOTH proved net-harmful when scored with the
+        # anatomy-immune seam detector (tools/seam_detect.py): mean max-seam rose
+        # 2.55→3.87 and →4.06, worse on 18–20 of 32 scans. The in-range best that
+        # this estimator already picks IS the correct physical shift; the higher
+        # off-range peak is the alias to ignore, not the signal. Do not re-add an
+        # alias-rejection gate here without re-validating against the detector.
         MIN_CORR_DELTA = 0.60   # stricter for mid/bot (narrow ROIs are noisier)
         MAX_DELTA = 2.0    # cap per-seam divergence between top and mid/bot — larger
                            # values are correlation-edge artifacts from teeth periodicity
@@ -3216,6 +3230,42 @@ def reconstruct_image(
             _raw_mid.append(dm); _conf_mid.append(cm)
             _raw_bot.append(db); _conf_bot.append(cb)
 
+        # ── DEBUG: wide correlation curves to expose periodicity aliasing ──
+        # PUREXS_ROWSHIFT_DEBUG=1 logs, per seam, the full correlation curve over
+        # a WIDER dy range than the ±MAX_SHIFT the estimator uses. A true shift
+        # shows one sharp peak; teeth-periodicity aliasing shows several near-
+        # equal peaks (at dy_true ± period), and the ±MAX_SHIFT window can clip
+        # to the wrong one. Read-only — does not affect the applied shift.
+        if _os.environ.get("PUREXS_ROWSHIFT_DEBUG"):
+            _WIDE = 14
+            for _si, _sp in enumerate(_grouped_seams):
+                _llo = max(_sp - STRIP_W - STRIP_GAP, 0); _lhi = max(_sp - STRIP_GAP, 0)
+                _rlo = min(_sp + STRIP_GAP, width); _rhi = min(_sp + STRIP_W + STRIP_GAP, width)
+                if _lhi - _llo < 3 or _rhi - _rlo < 3:
+                    continue
+                _ls = normalized[_grad_row_lo:_grad_row_hi, _llo:_lhi].mean(axis=1)
+                _rs = normalized[_grad_row_lo:_grad_row_hi, _rlo:_rhi].mean(axis=1)
+                _L = len(_ls)
+                if _L < 80:
+                    continue
+                _curve = {}
+                for _dy in range(-_WIDE, _WIDE + 1):
+                    if _dy == 0: _a, _b = _ls, _rs
+                    elif _dy > 0: _a, _b = _ls[_dy:], _rs[:_L - _dy]
+                    else: _a, _b = _ls[:_L + _dy], _rs[-_dy:]
+                    if len(_a) < 60: continue
+                    _ac = _a - _a.mean(); _bc = _b - _b.mean()
+                    _dn = float(np.sqrt((_ac ** 2).sum() * (_bc ** 2).sum()))
+                    if _dn < 1e-6: continue
+                    _curve[_dy] = float((_ac * _bc).sum() / _dn)
+                if not _curve: continue
+                _peaks = sorted(_curve.items(), key=lambda kv: -kv[1])[:3]
+                _c0 = _curve.get(0, 0.0)
+                log.info("ROWSHIFT_DBG seam %2d @col%-4d: top3=%s  corr@0=%+.3f  in-window-best=%+.2f",
+                         _si, _sp,
+                         " ".join(f"dy{d:+d}:{c:+.3f}" for d, c in _peaks),
+                         _c0, _raw_top[_si])
+
         # Top dys — identical to v13: gate by MIN_CORR, apply DAMPEN.
         _dys_top = [(d if c >= MIN_CORR else 0.0) * DAMPEN
                     for d, c in zip(_raw_top, _conf_top)]
@@ -3263,16 +3313,25 @@ def reconstruct_image(
         _shifts_bot = _cum_bot - float(np.median(_cum_bot))
 
         # ── Manual per-batch tweaks (visually-tuned residuals) ─────────
-        # Batches identified by the raw-col they contain (not by index,
-        # which varies if seam detection picks up different counts between
-        # scans). Value is desired additional DOWNWARD shift in the FINAL
-        # rotated image, in pixels. We subtract it from the raw shift
-        # because raw-up == final-down after the 180° rotation.
-        _MANUAL_TWEAKS_FINAL_DOWN_PX = [
-            (420, 10.0),  # R10 batch (raw cols ~349-491) — user-tuned +10 px down
-            (615, 10.0),  # R9 batch  (raw cols ~492-740) — user-tuned +10 px down
-            (865, 4.0),   # R8 batch  (raw cols ~740-989) — user-tuned +4 px down
-        ]
+        # DISABLED 2026-07-15. These were hand-tuned DOWNWARD shifts keyed to
+        # the raw columns they land on (420/615/865 → +10/+10/+4 px). Because
+        # those columns exist in EVERY scan, the tweaks fired on every patient,
+        # not just the one they were tuned against. On scan_20260715_183452
+        # they stacked a ~10-12 px vertical step onto batch boundaries in the
+        # right-of-centre mandible/molar region — the "distorted vertical line"
+        # staff reported. Empirically (PUREXS_NO_MANUAL_TWEAKS) removing them
+        # dropped that scan's seam from 12 px → 2 px with ≤1 px change on four
+        # other recent scans, i.e. no regression. This matches the earlier
+        # standing conclusion that per-scan manual tweaks don't generalise; the
+        # data-driven auto row-shift above is the mechanism we keep. List left
+        # empty (not deleted) so the plumbing survives if a *data-driven*
+        # per-batch correction is ever added.
+        _MANUAL_TWEAKS_FINAL_DOWN_PX: list[tuple[int, float]] = []
+        if _os.environ.get("PUREXS_LEGACY_TWEAKS"):
+            # Reproduce the pre-2026-07-15 (buggy) behavior for A/B validation
+            # only. NOT for production use — this is the code path that drew the
+            # "distorted vertical line" report.
+            _MANUAL_TWEAKS_FINAL_DOWN_PX = [(420, 10.0), (615, 10.0), (865, 4.0)]
         for _anchor_raw_col, _final_dy in _MANUAL_TWEAKS_FINAL_DOWN_PX:
             _bi = next(
                 (i for i, (s, e) in enumerate(zip(_batch_starts, _batch_ends))
